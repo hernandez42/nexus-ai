@@ -6,11 +6,18 @@
  * and persistent state management.
  */
 
-import { Agent } from "@earendil-works/pi-agent-core";
 import { MemoryStore } from "./memory";
 import { ToolRegistry } from "./tools";
 import { EvolutionEngine } from "./evolution";
 import { Logger } from "./logger";
+
+let AgentClass: any;
+try {
+  const pi = require("@earendil-works/pi-agent-core");
+  AgentClass = pi.Agent;
+} catch {
+  // Pi-Mono not available — stub fallback
+}
 
 export interface PiMonoAgentConfig {
   name: string;
@@ -28,11 +35,18 @@ export interface PiMonoAgentConfig {
  * This creates the agent structure; the caller must set the model
  * before executing prompts.
  */
-export function createPiMonoAgent(config: PiMonoAgentConfig): Agent {
-  const agent = new Agent({
+export function createPiMonoAgent(config: PiMonoAgentConfig): any {
+  if (!AgentClass) {
+    return {
+      prompt: async () => "Pi-Mono not available",
+      subscribe: () => () => {},
+      waitForIdle: async () => {},
+    };
+  }
+
+  const agent = new AgentClass({
     initialState: {
       systemPrompt: config.systemPrompt,
-      // model must be set before use — caller responsibility
     } as any,
   });
 
@@ -46,7 +60,7 @@ export function createPiMonoAgent(config: PiMonoAgentConfig): Agent {
  * This function collects the response from the agent_end event.
  */
 export async function runPiMonoTask(
-  agent: Agent,
+  agent: any,
   task: string,
   context: {
     memory: MemoryStore;
@@ -101,7 +115,7 @@ export async function runPiMonoTask(
  * Create a multi-turn conversation with Pi-Mono agent.
  */
 export async function converseWithPiMono(
-  agent: Agent,
+  agent: any,
   messages: Array<{ role: "user" | "assistant"; content: string }>,
   context: {
     memory: MemoryStore;

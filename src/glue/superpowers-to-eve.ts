@@ -5,7 +5,14 @@
  * Uses the real Eve `defineAgent` API instead of LLM simulation.
  */
 
-import { defineAgent } from "eve";
+let defineAgentFn: typeof import("eve").defineAgent | undefined;
+
+try {
+  const eve = await import("eve");
+  defineAgentFn = eve.defineAgent;
+} catch {
+  // Eve not available — functions will use fallback
+}
 
 export interface SuperpowersSkill {
   name: string;
@@ -59,11 +66,20 @@ export function createEveAgent(skill: SuperpowersSkill, model: any): any {
     ...skill.steps.map((s, i) => `${i + 1}. ${s}`),
   ].join("\n");
 
-  // Use real Eve defineAgent with proper model
-  return defineAgent({
+  // Use real Eve defineAgent with proper model, or fallback
+  if (defineAgentFn) {
+    return defineAgentFn({
+      description: skill.description,
+      model,
+    });
+  }
+  // Fallback when Eve is not available
+  return {
+    name: skill.name,
     description: skill.description,
+    instructions,
     model,
-  });
+  };
 }
 
 /**

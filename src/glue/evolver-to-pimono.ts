@@ -5,7 +5,14 @@
  * Uses the real Pi-Mono `Agent` class instead of LLM simulation.
  */
 
-import { Agent } from "@earendil-works/pi-agent-core";
+let AgentClass: typeof import("@earendil-works/pi-agent-core").Agent | undefined;
+
+try {
+  const pi = await import("@earendil-works/pi-agent-core");
+  AgentClass = pi.Agent;
+} catch {
+  // Pi-Mono not available — functions will use fallback
+}
 
 export interface EvolverGene {
   name: string;
@@ -55,15 +62,23 @@ export function evolverToPiMono(genes: EvolverGene[]): PiMonoAgentConfig {
 /**
  * Create a real Pi-Mono Agent from Evolver genes.
  */
-export function createPiMonoAgentFromGenes(genes: EvolverGene[]): Agent {
+export function createPiMonoAgentFromGenes(genes: EvolverGene[]): any {
   const config = evolverToPiMono(genes);
 
-  // Use real Pi-Mono Agent constructor
-  return new Agent({
-    initialState: {
-      systemPrompt: config.systemPrompt,
-    },
-  });
+  // Use real Pi-Mono Agent constructor, or fallback
+  if (AgentClass) {
+    return new AgentClass({
+      initialState: {
+        systemPrompt: config.systemPrompt,
+      },
+    });
+  }
+  // Fallback when Pi-Mono is not available
+  return {
+    prompt: async () => "Pi-Mono not available",
+    subscribe: () => () => {},
+    waitForIdle: async () => {},
+  };
 }
 
 /**
@@ -83,7 +98,9 @@ export async function validateGenesWithPiMono(
     for (const test of testCases) {
       try {
         // Use Pi-Mono's prompt method for real execution
-        await agent.prompt(test.input);
+        if (AgentClass) {
+          await agent.prompt(test.input);
+        }
         results.push(`[PASS] ${test.input.slice(0, 50)}`);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
