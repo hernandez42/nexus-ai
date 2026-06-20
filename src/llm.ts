@@ -9,9 +9,6 @@
  *   const response = await llm.chat([{ role: "user", content: "Hello" }]);
  */
 
-import OpenAI from "openai";
-import Anthropic from "@anthropic-ai/sdk";
-
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -114,9 +111,7 @@ function createOpenAIClient(config: LLMConfig): LLMClient {
 // ============================================================
 
 function createAnthropicClient(config: LLMConfig): LLMClient {
-  const client = new Anthropic({
-    apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY,
-  });
+  const apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
   const model = config.model || "claude-3-5-sonnet-20241022";
 
   return {
@@ -124,16 +119,30 @@ function createAnthropicClient(config: LLMConfig): LLMClient {
       const systemMsg = messages.find(m => m.role === "system")?.content || "";
       const nonSystem = messages.filter(m => m.role !== "system");
 
-      const response = await client.messages.create({
-        model,
-        max_tokens: config.maxTokens ?? 4096,
-        temperature: config.temperature ?? 0.7,
-        system: systemMsg || undefined,
-        messages: nonSystem.map(m => ({ role: m.role as "user" | "assistant", content: m.content })),
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey || "",
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: config.maxTokens ?? 4096,
+          temperature: config.temperature ?? 0.7,
+          system: systemMsg || undefined,
+          messages: nonSystem.map(m => ({ role: m.role, content: m.content })),
+        }),
       });
 
-      const content = response.content[0];
-      return content.type === "text" ? content.text : "";
+      if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`Anthropic API error ${response.status}: ${err}`);
+      }
+
+      const data = await response.json();
+      const content = data.content?.[0];
+      return content?.type === "text" ? content.text : "";
     },
   };
 }
