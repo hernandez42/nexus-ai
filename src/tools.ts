@@ -189,8 +189,9 @@ export class ToolRegistry {
       execute: async (p) => {
         try {
           return { data: JSON.parse(p.text as string), valid: true };
-        } catch (e: any) {
-          return { error: e.message, valid: false };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg, valid: false };
         }
       },
     });
@@ -358,8 +359,9 @@ export class ToolRegistry {
           const res = await fetch(p.url as string, { headers: (p.headers as any) || {} });
           const text = await res.text();
           return { status: res.status, content: text.slice(0, 10000), contentType: res.headers.get("content-type") };
-        } catch (e: any) {
-          return { error: e.message };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg };
         }
       },
     });
@@ -377,8 +379,9 @@ export class ToolRegistry {
           });
           const text = await res.text();
           return { status: res.status, content: text.slice(0, 5000) };
-        } catch (e: any) {
-          return { error: e.message };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg };
         }
       },
     });

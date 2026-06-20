@@ -241,8 +241,8 @@ Respond with JSON:
         try {
           const result = await tool.execute(params);
           observationContent = JSON.stringify(result);
-        } catch (e: any) {
-          observationContent = `Error: ${e.message}`;
+        } catch (e: unknown) {
+          observationContent = `Error: ${e instanceof Error ? e.message : String(e)}`;
         }
       } else if (toolName) {
         observationContent = `Tool "${toolName}" not found.`;

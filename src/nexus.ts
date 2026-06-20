@@ -433,8 +433,8 @@ async function runGlue(config: any, log: Logger) {
       const results = convertAllSkills(config.repos.superpowers, join(config.workspaceDir, "agent"));
       generateSkillIndex(results, join(config.workspaceDir, "agent", "skills", "skill-index.md"));
       log.info(`Superpowers → Eve: ${results.filter((r: any) => r.converted).length}/${results.length} skills`);
-    } catch (e: any) {
-      log.error("Superpowers → Eve failed", { error: e.message });
+    } catch (e: unknown) {
+      log.error("Superpowers → Eve failed", { error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -446,8 +446,8 @@ async function runGlue(config: any, log: Logger) {
         generatePiExtension(genes, join(config.workspaceDir, ".pi", "extensions", "evolver-bridge.ts"));
         log.info(`Evolver → Pi-Mono: ${genes.length} genes`);
       }
-    } catch (e: any) {
-      log.error("Evolver → Pi-Mono failed", { error: e.message });
+    } catch (e: unknown) {
+      log.error("Evolver → Pi-Mono failed", { error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -460,8 +460,8 @@ async function runGlue(config: any, log: Logger) {
         log.info(`AutoResearch → Evolver: ${r.converted} experiments`);
       }
       generateAutoResearchGene(join(config.repos.evolver, "assets", "gep", "gene_autoresearch.json"), config.repos.autoresearch);
-    } catch (e: any) {
-      log.error("AutoResearch → Evolver failed", { error: e.message });
+    } catch (e: unknown) {
+      log.error("AutoResearch → Evolver failed", { error: e instanceof Error ? e.message : String(e) });
     }
   }
 }
