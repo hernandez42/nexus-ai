@@ -29,11 +29,76 @@ export interface LLMClient {
 }
 
 // ============================================================
+// Retry / Backoff Wrapper
+// ============================================================
+
+interface RetryConfig {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  retryableStatuses: number[];
+}
+
+const DEFAULT_RETRY: RetryConfig = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+  retryableStatuses: [429, 500, 502, 503, 504],
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function withRetry(
+  client: LLMClient,
+  retryConfig: Partial<RetryConfig> = {}
+): LLMClient {
+  const cfg = { ...DEFAULT_RETRY, ...retryConfig };
+
+  return {
+    async chat(messages) {
+      let lastError: Error | undefined;
+
+      for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+        try {
+          return await client.chat(messages);
+        } catch (e: unknown) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+
+          // Check if error is retryable
+          const isRetryable = cfg.retryableStatuses.some(status =>
+            lastError!.message.includes(String(status))
+          ) || lastError.message.includes("timeout") || lastError.message.includes("ECONNRESET");
+
+          if (!isRetryable || attempt === cfg.maxRetries) {
+            throw lastError;
+          }
+
+          // Exponential backoff with jitter
+          const delay = Math.min(
+            cfg.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000,
+            cfg.maxDelayMs
+          );
+
+          console.warn(`[LLM] Retry ${attempt + 1}/${cfg.maxRetries} after ${Math.round(delay)}ms: ${lastError.message.slice(0, 100)}`);
+          await sleep(delay);
+        }
+      }
+
+      throw lastError;
+    },
+
+    chatStream: client.chatStream,
+  };
+}
+
+// ============================================================
 // OpenAI Provider
 // ============================================================
 
 function createOpenAIClient(config: LLMConfig): LLMClient {
-  const apiKey = config.apiKey || process.env.OPENAI_API_KEY;
+  const apiKey = config.apiKey || process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
   const baseURL = config.baseURL || "https://api.openai.com/v1";
   const model = config.model || "gpt-4o";
 
@@ -111,7 +176,7 @@ function createOpenAIClient(config: LLMConfig): LLMClient {
 // ============================================================
 
 function createAnthropicClient(config: LLMConfig): LLMClient {
-  const apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
+  const apiKey = config.apiKey || process.env.LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
   const model = config.model || "claude-3-5-sonnet-20241022";
 
   return {
@@ -234,19 +299,25 @@ GOAL: optimize_kernel_selection | REASON: Need to understand Hopper vs non-Hoppe
 // Factory
 // ============================================================
 
-export function createLLM(config: LLMConfig): LLMClient {
+export function createLLM(config: LLMConfig, retryConfig?: Partial<RetryConfig>): LLMClient {
+  let client: LLMClient;
   switch (config.provider) {
     case "openai":
-      return createOpenAIClient(config);
+      client = createOpenAIClient(config);
+      break;
     case "anthropic":
-      return createAnthropicClient(config);
+      client = createAnthropicClient(config);
+      break;
     case "ollama":
-      return createOllamaClient(config);
+      client = createOllamaClient(config);
+      break;
     case "mock":
-      return createMockClient(config);
+      client = createMockClient(config);
+      break;
     default:
       throw new Error(`Unknown LLM provider: ${config.provider}`);
   }
+  return withRetry(client, retryConfig);
 }
 
 // ============================================================

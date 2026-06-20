@@ -3,7 +3,7 @@
  * Environment variables take precedence over config file values.
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync } from "fs";
 
 export type LLMProvider = "openai" | "anthropic" | "ollama" | "mock";
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -128,6 +128,5 @@ export function generateDefaultConfig(path: string): void {
     persistExperiences: true,
   };
 
-  const { writeFileSync } = require("fs");
   writeFileSync(path, JSON.stringify(defaults, null, 2) + "\n");
 }

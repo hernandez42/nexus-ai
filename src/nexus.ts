@@ -42,10 +42,15 @@ async function main() {
   const skipSelfAwareness = args.includes("--skip-self-awareness");
   const prompt = args.find(a => !a.startsWith("--")) || "Analyze the autoresearch codebase and tell me what model architecture it uses.";
 
-  if (initConfig || !existsSync(configPath)) {
+  if (initConfig) {
     generateDefaultConfig(configPath);
     console.log(`Generated default config: ${configPath}`);
-    if (initConfig) return;
+    return;
+  }
+
+  if (!existsSync(configPath)) {
+    console.error(`Config not found: ${configPath}. Run with --init to generate.`);
+    process.exit(1);
   }
 
   const config = loadConfig(configPath);
