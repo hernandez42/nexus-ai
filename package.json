@@ -1,6 +1,6 @@
 {
   "name": "nexus-ai",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Autonomous cognitive evolution framework — self-awareness, continuous deconstruction, genetic evolution, and persistent memory",
   "type": "module",
   "main": "dist/nexus.js",
@@ -17,11 +17,13 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "file:../pi-mono/packages/agent",
     "chalk": "^5.3.0",
-    "eve": "file:../eve/packages/eve",
     "gray-matter": "^4.0.3",
     "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "@earendil-works/pi-agent-core": "file:../pi-mono/packages/agent",
+    "eve": "file:../eve/packages/eve"
   },
   "devDependencies": {
     "tsx": "^4.0.0",
