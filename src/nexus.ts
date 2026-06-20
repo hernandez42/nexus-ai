@@ -12,7 +12,8 @@
  *   6. 全部结果写入记忆
  *
  * 使用方式：
- *   npm run start                    # 完整流程
+ *   npm run start                    # 完整流程（单次）
+ *   npm run start -- --daemon        # 守护模式（循环运行）
  *   npm run start -- "你的问题"       # 自定义问题
  *   npm run start -- --skip-glue     # 跳过格式转换
  *   npm run start -- --skip-deconstruct  # 跳过解构
@@ -33,10 +34,29 @@ import { convertAllSkills, generateSkillIndex } from "./glue/superpowers-to-eve"
 import { loadGenes, generatePiExtension } from "./glue/evolver-to-pimono";
 import { convertResultsToEvolverSignals, generateAutoResearchGene } from "./glue/autoresearch-to-evolver";
 
+// ============================================================
+// Crash Protection — P2 #14
+// ============================================================
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err.message);
+  console.error(err.stack);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled rejection:", reason);
+  process.exit(1);
+});
+
+// ============================================================
+// Main
+// ============================================================
+
 async function main() {
   const args = process.argv.slice(2);
   const configPath = args.find((_, i) => args[i - 1] === "--config") || "./config.json";
   const initConfig = args.includes("--init");
+  const daemonMode = args.includes("--daemon");
   const skipGlue = args.includes("--skip-glue");
   const skipDeconstruct = args.includes("--skip-deconstruct");
   const skipSelfAwareness = args.includes("--skip-self-awareness");
@@ -66,13 +86,59 @@ async function main() {
   mkdirSync(config.logDir, { recursive: true });
 
   const log = new Logger("Nexus", config.logDir, config.logLevel);
-  log.info("Nexus starting", { llm: config.llm.provider, model: config.llm.model });
+  log.info("Nexus starting", { llm: config.llm.provider, model: config.llm.model, daemon: daemonMode });
 
   // ============================================================
   // 0. Global Memory
   // ============================================================
   const memory = new MemoryStore(join(config.memoryDir, "persistent"));
   memory.autoSave();
+
+  // P2 #13: Periodic memory save every 30s
+  const saveInterval = setInterval(() => {
+    if (memory.stats().total > 0) memory.save();
+  }, 30000);
+
+  // ============================================================
+  // P0 #4: Daemon Mode — Loop instead of exit
+  // ============================================================
+  if (daemonMode) {
+    console.log("Daemon mode: Nexus will loop every 60s. Press Ctrl+C to stop.");
+    while (true) {
+      try {
+        await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
+      } catch (e: unknown) {
+        log.error("Daemon cycle failed", { error: e instanceof Error ? e.message : String(e) });
+      }
+      log.info("Daemon: sleeping 60s");
+      await sleep(60000);
+    }
+  } else {
+    await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
+  }
+
+  clearInterval(saveInterval);
+  memory.save();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+interface CycleOptions {
+  skipGlue: boolean;
+  skipDeconstruct: boolean;
+  skipSelfAwareness: boolean;
+  prompt: string;
+}
+
+async function runCycle(
+  config: any,
+  log: Logger,
+  memory: MemoryStore,
+  options: CycleOptions
+) {
+  const { skipGlue, skipDeconstruct, skipSelfAwareness, prompt } = options;
 
   const pastMemories = memory.query({ text: prompt, topK: 5, minSimilarity: 0.01 });
   const memoryContext = pastMemories.length > 0
@@ -106,7 +172,6 @@ async function main() {
     deconstructions = await deconstructor.run();
     log.info(`Deconstruction: ${deconstructions.length} cycles, max depth ${Math.max(...deconstructions.map(d => d.rebuilt.depthReached), 0)}`);
 
-    // Persist deconstructions to memory
     for (const d of deconstructions) {
       memory.add({
         layer: "semantic",
@@ -118,7 +183,7 @@ async function main() {
   }
 
   // ============================================================
-  // 4. Self-Awareness (with deconstruction context)
+  // 4. Self-Awareness
   // ============================================================
   let selfModel = null;
   if (!skipSelfAwareness && config.modules.selfAwareness.enabled) {
@@ -181,7 +246,7 @@ async function main() {
   }
 
   // ============================================================
-  // 5. Evolution Engine — Initialize population
+  // 5. Evolution Engine
   // ============================================================
   log.info("Initializing evolution engine");
   const evolution = new EvolutionEngine(
@@ -197,7 +262,7 @@ async function main() {
   log.info(`Evolution: ${evolution.getAlive().length} organisms seeded`);
 
   // ============================================================
-  // 6. TriOrchestrator (with evolution + memory + self-awareness)
+  // 6. TriOrchestrator
   // ============================================================
   log.info("Starting TriOrchestrator");
 
@@ -216,7 +281,6 @@ async function main() {
     systemPrompt += `\n\n[DECONSTRUCTION]\n${deconstructions[deconstructions.length - 1].breakthrough.whatEmerged.slice(0, 200)}`;
   }
 
-  // Load evolved capabilities from memory as tools
   const evolvedCapabilities = memory.query({
     text: "capability tool strategy",
     layer: "procedural",
@@ -316,7 +380,7 @@ async function main() {
     config.modules.triOrchestrator.maxIterations
   );
 
-  // Apply evolution pressure from TriOrchestrator results
+  // Evolution pressure
   if (result.goals.length > 0) {
     for (const goal of result.goals) {
       evolution.applyPressure({
@@ -326,7 +390,6 @@ async function main() {
       });
     }
   } else {
-    // No goals = task was easy, apply mild positive pressure (survival of the fittest)
     evolution.applyPressure({
       source: "task-completed-successfully",
       intensity: 2,
@@ -387,7 +450,6 @@ async function main() {
     }
   }
 
-  // Persist evolution state
   for (const org of evolution.getAlive()) {
     memory.add({
       layer: "semantic",
