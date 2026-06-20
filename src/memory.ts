@@ -259,13 +259,24 @@ export class MemoryStore {
   // ============================================================
 
   save(): void {
-    const data = Array.from(this.memories.values()).map(m => ({
-      ...m,
-      // Don't persist embedding (will be recomputed)
-      embedding: undefined,
-    }));
-    writeFileSync(join(this.dir, "memory.json"), JSON.stringify(data, null, 2));
-    this.dirty = false;
+    try {
+      const data = Array.from(this.memories.values()).map(m => ({
+        ...m,
+        // Don't persist embedding (will be recomputed)
+        embedding: undefined,
+      }));
+      const path = join(this.dir, "memory.json");
+      // Ensure directory exists before writing
+      if (!existsSync(this.dir)) {
+        mkdirSync(this.dir, { recursive: true });
+      }
+      writeFileSync(path, JSON.stringify(data, null, 2));
+      this.dirty = false;
+      console.log(`[Memory] Saved ${data.length} entries to ${path}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[Memory] Save failed: ${msg}`);
+    }
   }
 
   private load(): void {

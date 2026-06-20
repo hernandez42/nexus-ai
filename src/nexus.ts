@@ -131,7 +131,12 @@ async function main() {
           metadata: { cycle: cycleCount, error: err.message, stack: stack.slice(0, 500), durationMs: Date.now() - cycleStart },
         });
       }
-      memory.save(); // Force save after every cycle
+      try {
+        memory.save(); // Force save after every cycle
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log.error("Memory save failed", { cycle: cycleCount, error: msg });
+      }
       log.info("Daemon: sleeping 60s", { cycle: cycleCount, memoryEntries: memory.stats().total });
       await sleep(60000);
     }
