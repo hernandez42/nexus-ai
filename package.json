@@ -9,13 +9,12 @@
   },
   "scripts": {
     "start": "tsx src/nexus.ts",
+    "godel": "tsx src/godel-nexus.ts",
     "dev": "tsx src/nexus.ts --skip-glue",
     "init": "tsx src/nexus.ts --init",
     "build": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "pipeline": "tsx src/pipeline.ts",
-    "validate": "tsx src/validate-eve-skills.ts"
+    "test:watch": "vitest"
   },
   "dependencies": {
     "chalk": "^5.3.0",
