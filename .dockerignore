@@ -1,0 +1,13 @@
+node_modules/
+nexus-workspace/
+*.log
+.env
+.env.local
+.git/
+.gitignore
+.github/
+README.md
+CHANGELOG.md
+docs/
+tests/
+example/

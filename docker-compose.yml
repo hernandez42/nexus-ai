@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  nexus:
+    build: .
+    container_name: nexus-ai
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
+    volumes:
+      - ./nexus-workspace:/app/nexus-workspace
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
