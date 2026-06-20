@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-06-20
+
+### Added
+- Gödel Agent integration: recursive self-improvement framework (ACL 2025 paper)
+- `src/godel/introspection.ts`: runtime self-inspection (code, stack, variables, memory)
+- `src/godel/dynamic-actions.ts`: extensible action registry (10 builtin + dynamic proposal)
+- `src/godel-nexus.ts`: recursive main entry point (`npm run godel`)
+- `tests/godel.test.ts`: 20 tests for introspection + dynamic actions
+- `tests/godel-nexus.test.ts`: 10 tests for self-referential properties
+- `docs/GODEL.md`: Gödel Agent integration guide
+- `docs/API.md`: full API reference
+- `docs/DEVELOPING.md`: developer guide
+- CI: `npm test` step + godel module import checks
+
+### Changed
+- CI pipeline now runs vitest suite + smoke imports for godel modules
+- Total tests: 36 (4 test files)
+
 ## [0.2.0] - 2026-06-20
 
 ### Added
