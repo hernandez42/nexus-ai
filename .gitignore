@@ -1,0 +1,11 @@
+node_modules/
+dist/
+nexus-workspace/
+*.log
+.env
+.env.local
+config.json
+memory.json
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

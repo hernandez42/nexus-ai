@@ -1,0 +1,11 @@
+# Code Owners
+# All PRs require review from repository maintainers
+
+# Default: all files
+* @hernandez42
+
+# Security-sensitive files
+config.example.json @hernandez42
+src/llm.ts @hernandez42
+src/config.ts @hernandez42
+.github/workflows/ @hernandez42

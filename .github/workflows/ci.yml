@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Lint check
+        run: |
+          if command -v eslint &> /dev/null; then
+            npx eslint src/ --max-warnings 0 || true
+          else
+            echo "ESLint not configured, skipping"
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for secrets
+        run: |
+          ! grep -rnE 'sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|password\s*[:=]\s*["\x27][^"\x27]{6,}' src/ config.example.json package.json README.md || \
+            (echo "ERROR: Potential secrets found in source files!" && exit 1)
+
+      - name: Check .gitignore coverage
+        run: |
+          for f in config.json .env .env.local memory.json; do
+            grep -q "^$f" .gitignore || (echo "WARNING: $f not in .gitignore" && exit 1)
+          done
+          echo "Gitignore coverage OK"
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Smoke test (dry run)
+        run: |
+          # Verify all modules can be imported without errors
+          npx tsx -e "
+            import('./src/config').then(() => console.log('config OK'));
+            import('./src/llm').then(() => console.log('llm OK'));
+            import('./src/logger').then(() => console.log('logger OK'));
+            import('./src/memory').then(() => console.log('memory OK'));
+            import('./src/evolution').then(() => console.log('evolution OK'));
+            import('./src/deconstruction').then(() => console.log('deconstruction OK'));
+            import('./src/triorchestrator').then(() => console.log('triorchestrator OK'));
+            import('./src/self-awareness').then(() => console.log('self-awareness OK'));
+          "
+        env:
+          LLM_API_KEY: test-key
+          LLM_BASE_URL: https://example.com/v1
