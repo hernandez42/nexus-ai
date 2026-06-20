@@ -53,6 +53,13 @@ async function main() {
     process.exit(1);
   }
 
+  // P2 #12: Detect dual .git conflict (git init inside cloned repo)
+  const { existsSync: fsExists } = await import("fs");
+  if (fsExists("src/.git") && fsExists(".git")) {
+    console.warn("WARNING: Dual .git detected (src/.git + ./.git). This causes git conflicts.");
+    console.warn("  Fix: rm -rf src/.git && git add src/");
+  }
+
   const config = loadConfig(configPath);
   mkdirSync(config.workspaceDir, { recursive: true });
   mkdirSync(config.memoryDir, { recursive: true });
