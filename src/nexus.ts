@@ -234,26 +234,32 @@ async function main() {
     {
       name: "bash", description: "Run shell command (max 10s)", parameters: { command: "string" },
       execute: async (params: Record<string, unknown>) => {
-        const { execSync } = await import("child_process");
+        const { spawnSync } = await import("child_process");
         try {
-          const output = execSync(params.command as string, { encoding: "utf-8", timeout: 10000 });
-          return { output: output.slice(0, 1000) };
-        } catch (e: any) {
-          return { error: e.message.slice(0, 500) };
+          const result = spawnSync("sh", ["-c", params.command as string], {
+            encoding: "utf-8", timeout: 10000, maxBuffer: 1024 * 1024,
+          });
+          return { output: (result.stdout || "").slice(0, 1000) };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg.slice(0, 500) };
         }
       },
     },
     {
       name: "search", description: "Search files by pattern", parameters: { pattern: "string", directory: "string" },
       execute: async (params: Record<string, unknown>) => {
-        const { execSync } = await import("child_process");
+        const { spawnSync } = await import("child_process");
         try {
           const dir = params.directory as string || ".";
           const pattern = params.pattern as string;
-          const output = execSync(`find ${dir} -name "${pattern}" -type f 2>/dev/null | head -20`, { encoding: "utf-8" });
-          return { files: output.trim().split("\n").filter(Boolean) };
-        } catch (e: any) {
-          return { error: e.message };
+          const result = spawnSync("find", [dir, "-name", pattern, "-type", "f"], {
+            encoding: "utf-8", timeout: 10000,
+          });
+          return { files: (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 20) };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg };
         }
       },
     },

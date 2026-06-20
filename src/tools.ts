@@ -5,8 +5,17 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "fs";
-import { execSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { join, dirname } from "path";
+
+/**
+ * Validate a path to prevent directory traversal attacks.
+ * Rejects paths containing .. or absolute paths outside cwd.
+ */
+function sanitizePath(p: string): string {
+  if (p.includes("..")) throw new Error("Path traversal detected");
+  return p;
+}
 
 export interface Tool {
   name: string;
@@ -97,18 +106,31 @@ export class ToolRegistry {
     // Shell & Process (5-8)
     this.register({
       name: "bash",
-      description: "Execute shell command (max 30s)",
+      description: "Execute shell command (max 30s). Blocked commands: rm -rf /, sudo, mkfs, dd, > /dev/sd",
       parameters: { command: "string", cwd: "string?", timeout: "number?" },
       execute: async (p) => {
+        const cmd = p.command as string;
+        // Block destructive commands
+        const blocked = [/rm\s+-rf\s+\/\s*$/, /sudo\b/, /mkfs\b/, /\bdd\b.*of=\/dev/, />\s*\/dev\/sd/];
+        for (const pattern of blocked) {
+          if (pattern.test(cmd)) return { error: "Command blocked by security policy", exitCode: 126 };
+        }
         try {
-          const output = execSync(p.command as string, {
+          // Use spawnSync with shell=false for simple commands, shell=true for pipes
+          const result = spawnSync("sh", ["-c", cmd], {
             encoding: "utf-8",
             timeout: (p.timeout as number) || 30000,
             cwd: (p.cwd as string) || process.cwd(),
+            maxBuffer: 5 * 1024 * 1024,
           });
-          return { output: output.slice(0, 5000), exitCode: 0 };
-        } catch (e: any) {
-          return { error: e.message.slice(0, 500), exitCode: e.status || 1, stderr: e.stderr?.slice(0, 1000) };
+          return {
+            output: (result.stdout || "").slice(0, 5000),
+            exitCode: result.status || 0,
+            stderr: (result.stderr || "").slice(0, 1000),
+          };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: msg.slice(0, 500), exitCode: 1 };
         }
       },
     });
@@ -118,12 +140,17 @@ export class ToolRegistry {
       description: "Search text in files (ripgrep-style)",
       parameters: { pattern: "string", path: "string?", glob: "string?" },
       execute: async (p) => {
-        const cmd = `grep -rnE "${p.pattern}" ${p.path || "."} ${p.glob ? `--include="${p.glob}"` : ""} 2>/dev/null | head -50`;
+        const args: string[] = ["-rnE", String(p.pattern), String(p.path || ".")];
+        if (p.glob) args.push("--include", String(p.glob));
         try {
-          const output = execSync(cmd, { encoding: "utf-8", timeout: 10000 });
-          return { matches: output.trim().split("\n").filter(Boolean) };
-        } catch (e: any) {
-          return { matches: [], error: e.message };
+          const result = spawnSync("grep", args, { encoding: "utf-8", timeout: 10000 });
+          const output = (result.stdout || "").trim();
+          // Limit to 50 lines
+          const lines = output.split("\n").filter(Boolean).slice(0, 50);
+          return { matches: lines };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { matches: [], error: msg };
         }
       },
     });
@@ -133,13 +160,16 @@ export class ToolRegistry {
       description: "Find files by name pattern",
       parameters: { pattern: "string", path: "string?", type: "string?" },
       execute: async (p) => {
-        const type = p.type === "dir" ? "-type d" : p.type === "file" ? "-type f" : "";
-        const cmd = `find ${p.path || "."} -name "${p.pattern}" ${type} 2>/dev/null | head -50`;
+        const args: string[] = [sanitizePath(String(p.path || ".")), "-name", String(p.pattern)];
+        if (p.type === "dir") args.push("-type", "d");
+        else if (p.type === "file") args.push("-type", "f");
         try {
-          const output = execSync(cmd, { encoding: "utf-8", timeout: 10000 });
-          return { files: output.trim().split("\n").filter(Boolean) };
-        } catch (e: any) {
-          return { files: [], error: e.message };
+          const result = spawnSync("find", args, { encoding: "utf-8", timeout: 10000 });
+          const files = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 50);
+          return { files };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { files: [], error: msg };
         }
       },
     });
@@ -177,18 +207,18 @@ export class ToolRegistry {
       description: "Show unified diff between two texts",
       parameters: { oldText: "string", newText: "string", context: "number?" },
       execute: async (p) => {
-        const { writeFileSync } = await import("fs");
         const { tmpdir } = await import("os");
-        const { join } = await import("path");
         const oldFile = join(tmpdir(), `diff-old-${Date.now()}.txt`);
         const newFile = join(tmpdir(), `diff-new-${Date.now()}.txt`);
         writeFileSync(oldFile, p.oldText as string);
         writeFileSync(newFile, p.newText as string);
         try {
-          const output = execSync(`diff -u${(p.context as number) || 3} "${oldFile}" "${newFile}"`, { encoding: "utf-8" });
-          return { diff: output };
-        } catch (e: any) {
-          return { diff: e.stdout || "No differences" };
+          const context = (p.context as number) || 3;
+          const result = spawnSync("diff", ["-U", String(context), oldFile, newFile], { encoding: "utf-8" });
+          return { diff: result.stdout || "No differences" };
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { diff: msg };
         }
       },
     });

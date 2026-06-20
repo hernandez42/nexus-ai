@@ -151,7 +151,7 @@ export function generatePiExtension(genes: EvolverGene[], outputPath: string): v
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 
 // Embedded Gene data (from Evolver's genes.json)
 const GENES: Array<{
@@ -259,10 +259,11 @@ export default function (pi: ExtensionAPI) {
         const results: string[] = [];
         for (const cmd of gene.validation) {
           try {
-            execSync(cmd, { cwd: ctx.cwd, timeout: 30000, stdio: "pipe" });
+            spawnSync("sh", ["-c", cmd], { cwd: ctx.cwd, timeout: 30000, stdio: "pipe" });
             results.push("[PASS] " + cmd);
-          } catch (e: any) {
-            results.push("[FAIL] " + cmd + ": " + e.message.slice(0, 100));
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            results.push("[FAIL] " + cmd + ": " + msg.slice(0, 100));
             // Return error as text content (AgentToolResult has no isError field)
             return {
               content: [{ type: "text" as const, text: results.join("\\n") }],

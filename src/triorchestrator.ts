@@ -859,12 +859,15 @@ GOAL: optimize_kernel_selection | REASON: Need to understand Hopper vs non-Hoppe
         description: "Run a shell command",
         parameters: { command: "string" },
         execute: async (params) => {
-          const { execSync } = await import("child_process");
+          const { spawnSync } = await import("child_process");
           try {
-            const output = execSync(params.command as string, { encoding: "utf-8", timeout: 5000 });
-            return { output: output.slice(0, 500) };
-          } catch (e: any) {
-            return { error: e.message };
+            const result = spawnSync("sh", ["-c", params.command as string], {
+              encoding: "utf-8", timeout: 5000, maxBuffer: 512 * 1024,
+            });
+            return { output: (result.stdout || "").slice(0, 500) };
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { error: msg };
           }
         },
       },
