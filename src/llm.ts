@@ -29,6 +29,30 @@ export interface LLMClient {
 }
 
 // ============================================================
+// Rate Limiter — P1 #7: prevent concurrent upstream hammering
+// ============================================================
+
+class RateLimiter {
+  private lastCall = 0;
+  private minInterval: number;
+
+  constructor(requestsPerSecond: number = 2) {
+    this.minInterval = 1000 / requestsPerSecond;
+  }
+
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastCall;
+    if (elapsed < this.minInterval) {
+      await sleep(this.minInterval - elapsed);
+    }
+    this.lastCall = Date.now();
+  }
+}
+
+const globalRateLimiter = new RateLimiter(2); // 2 req/s max
+
+// ============================================================
 // Retry / Backoff Wrapper
 // ============================================================
 
@@ -104,6 +128,7 @@ function createOpenAIClient(config: LLMConfig): LLMClient {
 
   return {
     async chat(messages) {
+      await globalRateLimiter.acquire();
       const response = await fetch(`${baseURL}/chat/completions`, {
         method: "POST",
         headers: {
@@ -181,6 +206,7 @@ function createAnthropicClient(config: LLMConfig): LLMClient {
 
   return {
     async chat(messages) {
+      await globalRateLimiter.acquire();
       const systemMsg = messages.find(m => m.role === "system")?.content || "";
       const nonSystem = messages.filter(m => m.role !== "system");
 
@@ -222,6 +248,7 @@ function createOllamaClient(config: LLMConfig): LLMClient {
 
   return {
     async chat(messages) {
+      await globalRateLimiter.acquire();
       const response = await fetch(`${baseURL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
