@@ -104,13 +104,35 @@ async function main() {
   // ============================================================
   if (daemonMode) {
     console.log("Daemon mode: Nexus will loop every 60s. Press Ctrl+C to stop.");
+    let cycleCount = 0;
     while (true) {
+      cycleCount++;
+      const cycleStart = Date.now();
       try {
         await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
+        memory.add({
+          layer: "episodic",
+          content: `Daemon cycle ${cycleCount} completed successfully`,
+          tags: ["daemon", "cycle-success"],
+          metadata: { cycle: cycleCount, durationMs: Date.now() - cycleStart },
+        });
       } catch (e: unknown) {
-        log.error("Daemon cycle failed", { error: e instanceof Error ? e.message : String(e) });
+        const err = e instanceof Error ? e : new Error(String(e));
+        const stack = err.stack || "no stack";
+        log.error("Daemon cycle failed", {
+          cycle: cycleCount,
+          error: err.message,
+          stack: stack.slice(0, 500),
+        });
+        memory.add({
+          layer: "episodic",
+          content: `Daemon cycle ${cycleCount} failed: ${err.message.slice(0, 200)}`,
+          tags: ["daemon", "cycle-fail", err.name],
+          metadata: { cycle: cycleCount, error: err.message, stack: stack.slice(0, 500), durationMs: Date.now() - cycleStart },
+        });
       }
-      log.info("Daemon: sleeping 60s");
+      memory.save(); // Force save after every cycle
+      log.info("Daemon: sleeping 60s", { cycle: cycleCount, memoryEntries: memory.stats().total });
       await sleep(60000);
     }
   } else {
