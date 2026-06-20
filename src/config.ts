@@ -5,9 +5,12 @@
 
 import { readFileSync, existsSync } from "fs";
 
+export type LLMProvider = "openai" | "anthropic" | "ollama" | "mock";
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
 export interface NexusConfig {
   llm: {
-    provider: string;
+    provider: LLMProvider;
     model: string;
     apiKey: string;
     baseURL?: string;
@@ -33,7 +36,7 @@ export interface NexusConfig {
     superpowers: string;
     autoresearch: string;
   };
-  logLevel: string;
+  logLevel: LogLevel;
   persistExperiences: boolean;
 }
 
@@ -44,10 +47,20 @@ export function loadConfig(path: string): NexusConfig {
 
   const raw = JSON.parse(readFileSync(path, "utf-8"));
 
+  // Validate provider
+  const rawProvider = raw.llm?.provider || "openai";
+  const validProviders: LLMProvider[] = ["openai", "anthropic", "ollama", "mock"];
+  const provider = validProviders.includes(rawProvider) ? (rawProvider as LLMProvider) : "openai";
+
+  // Validate logLevel
+  const rawLogLevel = raw.logLevel || "info";
+  const validLevels: LogLevel[] = ["debug", "info", "warn", "error"];
+  const logLevel = validLevels.includes(rawLogLevel) ? (rawLogLevel as LogLevel) : "info";
+
   // Environment variables override config file
   const config: NexusConfig = {
     llm: {
-      provider: raw.llm?.provider || "openai",
+      provider,
       model: raw.llm?.model || "gpt-4o",
       apiKey: process.env.LLM_API_KEY || raw.llm?.apiKey || "",
       baseURL: process.env.LLM_BASE_URL || raw.llm?.baseURL,
@@ -79,7 +92,7 @@ export function loadConfig(path: string): NexusConfig {
       superpowers: raw.repos?.superpowers || "../superpowers",
       autoresearch: raw.repos?.autoresearch || "../autoresearch",
     },
-    logLevel: raw.logLevel || "info",
+    logLevel,
     persistExperiences: raw.persistExperiences ?? true,
   };
 

@@ -63,13 +63,14 @@ export async function runPipeline(options: {
       detail: `${converted}/${skillResults.length} skills converted, index at ${indexPath}`,
     });
     log(`  -> ${converted} skills converted to Eve format`);
-  } catch (e: any) {
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
     results.push({
       phase: "superpowers-to-eve",
       status: "error",
-      detail: e.message,
+      detail: msg,
     });
-    log(`  ERROR: ${e.message}`);
+    log(`  ERROR: ${msg}`);
   }
 
   // ================================================================
@@ -97,13 +98,14 @@ export async function runPipeline(options: {
       });
       log(`  -> ${genes.length} Genes embedded into Pi-Mono extension`);
     }
-  } catch (e: any) {
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
     results.push({
       phase: "evolver-to-pimono",
       status: "error",
-      detail: e.message,
+      detail: msg,
     });
-    log(`  ERROR: ${e.message}`);
+    log(`  ERROR: ${msg}`);
   }
 
   // ================================================================
@@ -141,13 +143,14 @@ export async function runPipeline(options: {
     const genePath = join(options.evolverDir, "assets", "gep", "gene_autoresearch.json");
     generateAutoResearchGene(genePath);
     log(`  -> AutoResearch Gene written to ${genePath}`);
-  } catch (e: any) {
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
     results.push({
       phase: "autoresearch-to-evolver",
       status: "error",
-      detail: e.message,
+      detail: msg,
     });
-    log(`  ERROR: ${e.message}`);
+    log(`  ERROR: ${msg}`);
   }
 
   return results;
