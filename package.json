@@ -19,7 +19,9 @@
   "dependencies": {
     "chalk": "^5.3.0",
     "gray-matter": "^4.0.3",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "eve": "file:../eve/packages/eve",
+    "@earendil-works/pi-agent-core": "file:../pi-mono/packages/agent"
   },
   "devDependencies": {
     "tsx": "^4.0.0",
