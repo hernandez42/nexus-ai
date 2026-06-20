@@ -71,9 +71,14 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Smoke test (dry run)
+      - name: Run tests
+        run: npm test
+        env:
+          LLM_API_KEY: test-key
+          LLM_BASE_URL: https://example.com/v1
+
+      - name: Smoke test (module imports)
         run: |
-          # Verify all modules can be imported without errors
           npx tsx -e "
             import('./src/config').then(() => console.log('config OK'));
             import('./src/llm').then(() => console.log('llm OK'));
@@ -83,6 +88,8 @@ jobs:
             import('./src/deconstruction').then(() => console.log('deconstruction OK'));
             import('./src/triorchestrator').then(() => console.log('triorchestrator OK'));
             import('./src/self-awareness').then(() => console.log('self-awareness OK'));
+            import('./src/godel/introspection').then(() => console.log('godel/introspection OK'));
+            import('./src/godel/dynamic-actions').then(() => console.log('godel/dynamic-actions OK'));
           "
         env:
           LLM_API_KEY: test-key
