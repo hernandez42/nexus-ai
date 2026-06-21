@@ -37,6 +37,7 @@ import { convertAllSkills, generateSkillIndex } from "./glue/superpowers-to-eve"
 import { loadGenes, generatePiExtension } from "./glue/evolver-to-pimono";
 import { convertResultsToEvolverSignals, generateAutoResearchGene } from "./glue/autoresearch-to-evolver";
 import { startLarkBot, stopLarkBot } from "./lark";
+import { runToolLoop } from "./tool-loop";
 
 // ============================================================
 // Crash Protection — P2 #14
@@ -460,26 +461,47 @@ async function runCycle(
   log.info("Skills registered", { skills: skillRegistry.list() });
 
   // ============================================================
-  // 6a2. TriOrchestrator factory (LLM-based reasoning)
+  // 6a2. Tool Loop — pi/eve-style native tool calling (replaces TriOrchestrator JSON forcing)
   // ============================================================
   let streamCallback: ((chunk: string) => void) | undefined;
   if (onProgress) {
     streamCallback = onProgress;
   }
-  const runTriOrchestrator = async () => {
-    const orchestrator = new TriOrchestrator({
-      memoryDir: config.memoryDir,
-      systemPrompt,
-      maxReasoningSteps: config.modules.triOrchestrator.maxReasoningSteps,
-      tools,
-      genes,
-      llmCall: async (messages) => {
-        const response = await llm.chat(messages.map(m => ({ role: m.role as any, content: m.content })));
-        return response;
+  const runToolLoopReasoning = async (): Promise<string> => {
+    // Build tool definitions for OpenAI function calling
+    const toolDefs = tools.map(t => ({
+      name: t.name,
+      description: t.description,
+      parameters: {
+        type: "object",
+        properties: {
+          input: { type: "string", description: "Input parameter" },
+        },
       },
+      execute: async (params: Record<string, unknown>) => {
+        try {
+          const raw = await t.execute(params);
+          return typeof raw === "string" ? raw : JSON.stringify(raw);
+        } catch (e: unknown) {
+          return `Error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      },
+    }));
+
+    const result = await runToolLoop({
+      systemPrompt,
+      tools: toolDefs,
+      llm,
+      maxSteps: 10,
       onStream: streamCallback,
     });
-    return orchestrator.run(prompt, config.modules.triOrchestrator.maxIterations);
+
+    log.info("Tool loop completed", {
+      steps: result.steps.length,
+      toolCallsUsed: result.toolCallsUsed,
+    });
+
+    return result.answer;
   };
 
   // ============================================================
@@ -501,7 +523,14 @@ async function runCycle(
     /^(状态|更新|报告|总结|检查|汇报|情况|进展)/.test(prompt) ||
     /self.?assessment|status report|evolutionary state|your state/i.test(prompt);
 
-  let result;
+  let result: {
+    steps: Array<{ step: number; type: string; content: string; timestamp?: number }>;
+    goals: Array<{ target: string; priority: number; reason: string }>;
+    newCapabilities: Array<{ name: string; description: string; tools: string[]; strategy?: string; validation?: string }>;
+    finalAnswer: string;
+    iterations: number;
+    selfModel: any;
+  };
   if (isSimpleQuery) {
     // Simple query — use LocalReasoner (no LLM, fast)
     log.info("Simple query detected, using local reasoning");
@@ -523,14 +552,30 @@ async function runCycle(
         selfModel: undefined,
       };
     } else {
-      // Local failed even for simple query — fall back to LLM
-      log.info("Local reasoning failed for simple query, falling back to LLM");
-      result = await runTriOrchestrator();
+      // Local failed even for simple query — fall back to LLM tool loop
+      log.info("Local reasoning failed for simple query, falling back to tool loop");
+      const answer = await runToolLoopReasoning();
+      result = {
+        steps: [],
+        goals: [],
+        newCapabilities: [],
+        finalAnswer: answer,
+        iterations: 1,
+        selfModel: undefined,
+      };
     }
   } else {
-    // Complex query — go directly to LLM for real thinking
-    log.info("Complex query, going directly to TriOrchestrator (LLM)");
-    result = await runTriOrchestrator();
+    // Complex query — go directly to LLM tool loop (pi/eve style)
+    log.info("Complex query, using tool loop (LLM native tool calling)");
+    const answer = await runToolLoopReasoning();
+    result = {
+      steps: [],
+      goals: [],
+      newCapabilities: [],
+      finalAnswer: answer,
+      iterations: 1,
+      selfModel: undefined,
+    };
   }
 
   // Evolution pressure
