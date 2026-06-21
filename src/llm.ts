@@ -18,6 +18,7 @@ export interface LLMConfig {
   provider: "openai" | "anthropic" | "ollama" | "mock";
   model?: string;
   apiKey?: string;
+  apiKeys?: string[];     // Multi-key fallback
   baseURL?: string;      // For Ollama or custom endpoints
   temperature?: number;
   maxTokens?: number;
@@ -166,38 +167,84 @@ function withRetry(
 // ============================================================
 
 function createOpenAIClient(config: LLMConfig): LLMClient {
-  const apiKey = config.apiKey || process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
+  // Build key pool: explicit apiKeys[] > single apiKey > env vars
+  const keys: string[] = [];
+  if (config.apiKeys?.length) {
+    keys.push(...config.apiKeys);
+  }
+  if (config.apiKey) keys.push(config.apiKey);
+  const envKey = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
+  if (envKey) keys.push(envKey);
+  // Also check comma-separated env var
+  const envKeys = process.env.OPENAI_API_KEYS || process.env.LLM_API_KEYS;
+  if (envKeys) {
+    for (const k of envKeys.split(",").map(s => s.trim()).filter(Boolean)) {
+      if (!keys.includes(k)) keys.push(k);
+    }
+  }
+
   const baseURL = config.baseURL || "https://api.openai.com/v1";
   const model = config.model || "gpt-4o";
+
+  if (keys.length === 0) {
+    console.warn("[LLM] No API keys configured for OpenAI");
+  }
 
   return {
     async chat(messages) {
       await globalRateLimiter.acquire();
-      const response = await fetch(`${baseURL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: config.temperature ?? 0.7,
-          max_tokens: config.maxTokens ?? 4096,
-        }),
-      });
 
-      if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`LLM API error ${response.status}: ${err}`);
+      let lastError: Error | undefined;
+      for (let ki = 0; ki < keys.length; ki++) {
+        const apiKey = keys[ki];
+        try {
+          const response = await fetch(`${baseURL}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              messages,
+              temperature: config.temperature ?? 0.7,
+              max_tokens: config.maxTokens ?? 4096,
+            }),
+          });
+
+          if (!response.ok) {
+            const err = await response.text();
+            // 401 = bad key, skip to next key immediately
+            if (response.status === 401) {
+              console.warn(`[LLM] Key ${ki + 1}/${keys.length} auth failed, trying next`);
+              continue;
+            }
+            // 429/500/502/503/504 = retryable, but try next key first
+            if ([429, 500, 502, 503, 504].includes(response.status) && ki < keys.length - 1) {
+              console.warn(`[LLM] Key ${ki + 1}/${keys.length} got ${response.status}, trying next key`);
+              continue;
+            }
+            throw new Error(`LLM API error ${response.status}: ${err}`);
+          }
+
+          const data = await response.json();
+          const msg = data.choices?.[0]?.message as any;
+          return msg?.content || msg?.reasoning_content || "";
+        } catch (e: unknown) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+          // Network errors — try next key
+          if (ki < keys.length - 1) {
+            console.warn(`[LLM] Key ${ki + 1}/${keys.length} failed: ${lastError.message.slice(0, 80)}, trying next`);
+            continue;
+          }
+        }
       }
 
-      const data = await response.json();
-      const msg = data.choices?.[0]?.message as any;
-      return msg?.content || msg?.reasoning_content || "";
+      throw lastError || new Error("All API keys exhausted");
     },
 
     async *chatStream(messages) {
+      const apiKey = keys[0] || "";
       const response = await fetch(`${baseURL}/chat/completions`, {
         method: "POST",
         headers: {
@@ -245,39 +292,65 @@ function createOpenAIClient(config: LLMConfig): LLMClient {
 // ============================================================
 
 function createAnthropicClient(config: LLMConfig): LLMClient {
-  const apiKey = config.apiKey || process.env.LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
+  const keys: string[] = [];
+  if (config.apiKeys?.length) keys.push(...config.apiKeys);
+  if (config.apiKey) keys.push(config.apiKey);
+  const envKey = process.env.ANTHROPIC_API_KEY;
+  if (envKey) keys.push(envKey);
+  const envKeys = process.env.ANTHROPIC_API_KEYS;
+  if (envKeys) {
+    for (const k of envKeys.split(",").map(s => s.trim()).filter(Boolean)) {
+      if (!keys.includes(k)) keys.push(k);
+    }
+  }
   const model = config.model || "claude-3-5-sonnet-20241022";
 
   return {
     async chat(messages) {
       await globalRateLimiter.acquire();
-      const systemMsg = messages.find(m => m.role === "system")?.content || "";
-      const nonSystem = messages.filter(m => m.role !== "system");
 
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey || "",
-          "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: config.maxTokens ?? 4096,
-          temperature: config.temperature ?? 0.7,
-          system: systemMsg || undefined,
-          messages: nonSystem.map(m => ({ role: m.role, content: m.content })),
-        }),
-      });
+      let lastError: Error | undefined;
+      for (let ki = 0; ki < keys.length; ki++) {
+        const apiKey = keys[ki];
+        try {
+          const systemMsg = messages.find(m => m.role === "system")?.content || "";
+          const nonSystem = messages.filter(m => m.role !== "system");
 
-      if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`Anthropic API error ${response.status}: ${err}`);
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "x-api-key": apiKey || "",
+              "anthropic-version": "2023-06-01",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              max_tokens: config.maxTokens ?? 4096,
+              temperature: config.temperature ?? 0.7,
+              system: systemMsg || undefined,
+              messages: nonSystem.map(m => ({ role: m.role, content: m.content })),
+            }),
+          });
+
+          if (!response.ok) {
+            if ([401, 429, 500, 502, 503, 504].includes(response.status) && ki < keys.length - 1) {
+              console.warn(`[LLM] Anthropic key ${ki + 1}/${keys.length} got ${response.status}, trying next`);
+              continue;
+            }
+            const err = await response.text();
+            throw new Error(`Anthropic API error ${response.status}: ${err}`);
+          }
+
+          const data = await response.json();
+          const content = data.content?.[0];
+          return content?.type === "text" ? content.text : "";
+        } catch (e: unknown) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+          if (ki < keys.length - 1) continue;
+        }
       }
 
-      const data = await response.json();
-      const content = data.content?.[0];
-      return content?.type === "text" ? content.text : "";
+      throw lastError || new Error("All Anthropic API keys exhausted");
     },
   };
 }
