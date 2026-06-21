@@ -459,10 +459,19 @@ export class GEPEngine {
   private genes: Gene[] = [];
   private capabilities: Capability[] = [];
   private llmCall: (messages: Array<{role: string; content: string}>) => Promise<string>;
+  private availableTools: Set<string> = new Set();
 
-  constructor(genes: Gene[], llmCall: (messages: Array<{role: string; content: string}>) => Promise<string>) {
+  constructor(genes: Gene[], llmCall: (messages: Array<{role: string; content: string}>) => Promise<string>, availableTools?: string[]) {
     this.genes = genes;
     this.llmCall = llmCall;
+    if (availableTools) {
+      for (const t of availableTools) this.availableTools.add(t.toLowerCase());
+    }
+  }
+
+  setAvailableTools(tools: string[]): void {
+    this.availableTools.clear();
+    for (const t of tools) this.availableTools.add(t.toLowerCase());
   }
 
   /**
@@ -613,11 +622,19 @@ Respond with VALID JSON ONLY. No markdown, no other text:
         return null;
       }
 
+      // Validate tools: all referenced tools must exist
+      const tools = Array.isArray(parsed.tools) ? parsed.tools.map(String) : [];
+      const unknownTools = tools.filter((t: string) => !this.availableTools.has(t.toLowerCase()));
+      if (unknownTools.length > 0 && this.availableTools.size > 0) {
+        console.log(`[GEP] Rejected capability with unknown tools: ${parsed.name} → ${unknownTools.join(", ")}`);
+        return null;
+      }
+
       return {
         id: `cap_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         name: String(parsed.name),
         description: String(parsed.description || ""),
-        tools: Array.isArray(parsed.tools) ? parsed.tools.map(String) : [],
+        tools,
         strategy: Array.isArray(parsed.strategy) ? parsed.strategy.map(String) : [],
         validation: Array.isArray(parsed.validation) ? parsed.validation.map(String) : [],
         fitness: 0,
@@ -647,6 +664,12 @@ Respond with VALID JSON ONLY. No markdown, no other text:
       "greeting", "social_initiation", "conversational_state",
       "contextual_identity", "standard_greeting", "greeting_response",
       "greeting_identity", "autonomous_intent", "capability_genesis",
+      // Fake concrete: names that look concrete but reference impossible actions
+      "external_url", "webpage", "github_repository", "clone_repository",
+      "fetch_webpage", "parse_webpage", "read_url", "fetch_url",
+      // Identity/persona parsing (LLM can't actually do this)
+      "identity_signal", "persona_definition", "conversational_intent",
+      "semantic_intent", "intention_context", "conversational_initiator",
     ];
 
     // Check if name is composed entirely of buzzwords
@@ -736,7 +759,7 @@ export class TriOrchestrator {
       llmCall: config.llmCall,
     });
     this.explorer = new CuriosityDrivenExplorer(config.llmCall);
-    this.gep = new GEPEngine(config.genes, config.llmCall);
+    this.gep = new GEPEngine(config.genes, config.llmCall, config.tools.map(t => t.name));
   }
 
   /**
