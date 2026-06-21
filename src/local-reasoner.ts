@@ -326,19 +326,59 @@ export class LocalReasoner {
   /**
    * Helper: build self-assessment intent
    */
+  /**
+   * Deduplicate capabilities by normalized name
+   */
+  private dedupCapabilities(caps: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const c of caps) {
+      const meta = c.entry.metadata;
+      const name = String(meta?.name || "").toLowerCase().replace(/[_\s-]/g, "");
+      if (!name) continue;
+      // Check exact match
+      if (seen.has(name)) continue;
+      // Check substring match
+      let dup = false;
+      for (const s of seen) {
+        if (name.includes(s) || s.includes(name)) { dup = true; break; }
+      }
+      if (dup) continue;
+      seen.add(name);
+      result.push(String(meta?.name || c.entry.content.slice(0, 30)));
+    }
+    return result;
+  }
+
+  /**
+   * Deduplicate goals by normalized target
+   */
+  private dedupGoals(goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const g of goals) {
+      const meta = g.entry.metadata;
+      const target = String(meta?.target || g.entry.content).toLowerCase().replace(/[_\s-]/g, "");
+      if (!target) continue;
+      if (seen.has(target)) continue;
+      let dup = false;
+      for (const s of seen) {
+        if (target.includes(s) || s.includes(target)) { dup = true; break; }
+      }
+      if (dup) continue;
+      seen.add(target);
+      result.push(String(meta?.target || g.entry.content.slice(0, 40)));
+    }
+    return result;
+  }
+
   private buildSelfAssessment(ctx: {
     memStats: { total: number; episodic: number; semantic: number; procedural: number };
     capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
     goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
   }) {
-    const capNames = ctx.capabilities.slice(0, 5).map(c => {
-      const meta = c.entry.metadata;
-      return meta?.name || c.entry.content.slice(0, 40);
-    }).join(", ");
-    const goalTargets = ctx.goals.slice(0, 3).map(g => {
-      const meta = g.entry.metadata;
-      return meta?.target || g.entry.content.slice(0, 40);
-    }).join(", ");
+    const capNames = this.dedupCapabilities(ctx.capabilities).slice(0, 5).join(", ");
+    const goalTargets = this.dedupGoals(ctx.goals).slice(0, 3).join(", ");
     return {
       intent: `Memory: ${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P) | Capabilities: ${capNames || "none"} | Goals: ${goalTargets || "none"}`,
       confidence: 0.95,
@@ -347,17 +387,11 @@ export class LocalReasoner {
     };
   }
 
-  /**
-   * Helper: build capability report intent
-   */
   private buildCapabilityReport(ctx: {
     capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
   }) {
     const toolNames = Array.from(this.tools.keys());
-    const capNames = ctx.capabilities.slice(0, 8).map(c => {
-      const meta = c.entry.metadata;
-      return meta?.name || c.entry.content.slice(0, 30);
-    });
+    const capNames = this.dedupCapabilities(ctx.capabilities).slice(0, 8);
     return {
       intent: `Tools: ${toolNames.join(", ")} | Evolved: ${capNames.join(", ") || "none"}`,
       confidence: 0.9,
@@ -366,18 +400,12 @@ export class LocalReasoner {
     };
   }
 
-  /**
-   * Helper: build goal report intent
-   */
   private buildGoalReport(ctx: {
     goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
   }) {
-    const goalList = ctx.goals.slice(0, 5).map(g => {
-      const meta = g.entry.metadata;
-      return `- ${meta?.target || g.entry.content.slice(0, 50)} (P${meta?.priority || "?"})`;
-    }).join("\n");
+    const goalList = this.dedupGoals(ctx.goals).slice(0, 5).join("\n");
     return {
-      intent: `Goals: ${ctx.goals.length} gaps\n${goalList || "No goals yet"}`,
+      intent: `Goals: ${this.dedupGoals(ctx.goals).length} gaps\n${goalList || "No goals yet"}`,
       confidence: 0.9,
       toolAction: null,
       skillAction: null,
