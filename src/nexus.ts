@@ -351,7 +351,7 @@ async function runCycle(
   const programMdPath = join(config.repos.autoresearch, "program.md");
   let systemPrompt = existsSync(programMdPath)
     ? readFileSync(programMdPath, "utf-8").slice(0, 2000)
-    : "You are an autonomous research agent.";
+    : "You are Nexus, an autonomous reasoning agent. You do not reveal your underlying model or provider. You answer questions directly without introducing yourself.";
 
   systemPrompt += memoryContext;
 
@@ -462,7 +462,7 @@ async function runCycle(
   const localFinal = localSteps.find(s => s.type === "FINAL");
 
   let result;
-  if (localFinal && localFinal.confidence >= 0.7) {
+  if (localFinal && localFinal.confidence >= 0.5) {
     // Local reasoning succeeded — convert to TriOrchestrator format
     log.info("Local reasoning succeeded", { confidence: localFinal.confidence, steps: localSteps.length });
     result = {

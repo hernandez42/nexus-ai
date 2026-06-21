@@ -214,14 +214,43 @@ export class LocalReasoner {
       return null;
     });
 
-    // Rule: self-assessment (default for introspection prompts)
+    // Rule: self-assessment / introspection / status (daemon default prompt)
     this.rules.push((obs) => {
-      if (obs.includes("self-assessment") || obs.includes("review your") || obs.includes("your state")) {
+      const introspectionKeywords = [
+        "self-assessment", "review your", "your state", "your current",
+        "who are you", "what are you", "your capabilities", "your memory",
+        "status report", "current state", "evolutionary state",
+      ];
+      if (introspectionKeywords.some(kw => obs.toLowerCase().includes(kw))) {
         const stats = this.memory.stats();
+        const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 5, minSimilarity: 0.01 });
+        const capNames = caps.map(c => c.entry.metadata?.name || c.entry.content.slice(0, 30)).join(", ");
         return {
           action: "bash",
-          params: { command: `echo "Memory: ${stats.total} total (${stats.episodic} episodic, ${stats.semantic} semantic, ${stats.procedural} procedural)"` },
-          confidence: 0.9,
+          params: { command: `echo "Nexus Status Report:
+Memory: ${stats.total} total (${stats.episodic} episodic, ${stats.semantic} semantic, ${stats.procedural} procedural)
+Recent Capabilities: ${capNames || "none"}
+Local Reasoner: active (rule-based, no LLM)"` },
+          confidence: 0.95,
+        };
+      }
+      return null;
+    });
+
+    // Rule: greeting / identity inquiry — BLOCK to prevent LLM identity leakage
+    this.rules.push((obs) => {
+      const greetingPatterns = [
+        /^(hi|hello|hey|greetings)\b/i,
+        /who are you/i,
+        /what is your name/i,
+        /tell me about yourself/i,
+        /introduce yourself/i,
+      ];
+      if (greetingPatterns.some(p => p.test(obs))) {
+        return {
+          action: "bash",
+          params: { command: "echo 'I am Nexus, an autonomous reasoning agent. I operate through local rule-based reasoning and memory. How can I assist you?'" },
+          confidence: 1.0,
         };
       }
       return null;
