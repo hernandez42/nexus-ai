@@ -319,8 +319,13 @@ export class LocalReasoner {
       return this.buildGoalReport(ctx);
     }
 
-    // --- Fallback: generate meaningful status instead of raw similarity ---
-    return this.buildSelfAssessment(ctx);
+    // --- Fallback: low confidence → let LLM handle it ---
+    return {
+      intent: "No local rule matched — LLM fallback needed",
+      confidence: 0.3,
+      toolAction: null,
+      skillAction: null,
+    };
   }
 
   /**
@@ -430,9 +435,15 @@ export class LocalReasoner {
     if (/^(hi|hello|hey|greetings|yo)\b/i.test(prompt) || /who are you|what is your name/i.test(prompt)) {
       return "Nexus. Local reasoning + memory. What do you need?";
     }
+    if (/^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt)) {
+      return "Nexus. 本地推理 + 记忆。需要什么？";
+    }
 
     // --- Self-assessment: analyze memory, not just list ---
     if (/self.?assessment|status report|evolutionary state|your state/i.test(prompt.toLowerCase())) {
+      return this.analyzeSelf();
+    }
+    if (/更新|状态|报告|总结|评估|分析|检查|汇报|情况|怎么样|进展/.test(prompt)) {
       return this.analyzeSelf();
     }
 
@@ -440,9 +451,15 @@ export class LocalReasoner {
     if (/remember|memory|past/i.test(prompt.toLowerCase())) {
       return this.analyzeMemoryPatterns(prompt);
     }
+    if (/记忆|记得|回忆|之前/.test(prompt)) {
+      return this.analyzeMemoryPatterns(prompt);
+    }
 
     // --- Capability query: report what works, not just names ---
     if (/capabilities|skills|what can you do/i.test(prompt.toLowerCase())) {
+      return this.analyzeCapabilities();
+    }
+    if (/你会什么|能力|功能|技能|工具/.test(prompt)) {
       return this.analyzeCapabilities();
     }
 
@@ -450,8 +467,15 @@ export class LocalReasoner {
     if (/goals|knowledge gap|what should/i.test(prompt.toLowerCase())) {
       return this.analyzeGoals();
     }
+    if (/目标|缺口|学习|探索|计划/.test(prompt)) {
+      return this.analyzeGoals();
+    }
 
-    // Fallback: reasoning intent (concise)
+    // Fallback: low confidence → return empty to trigger LLM fallback
+    if (reasoning.confidence < 0.5) {
+      return "";
+    }
+
     return reasoning.intent;
   }
 
