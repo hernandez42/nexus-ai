@@ -12,11 +12,19 @@ import { EvolutionEngine } from "./evolution";
 import { Logger } from "./logger";
 
 let AgentClass: any;
-try {
-  const pi = require("@earendil-works/pi-agent-core");
-  AgentClass = pi.Agent;
-} catch {
-  // Pi-Mono not available — stub fallback
+let piTried = false;
+
+async function getAgentClass(): Promise<any> {
+  if (piTried) return AgentClass;
+  piTried = true;
+  try {
+    const pi = await import("@earendil-works/pi-agent-core");
+    AgentClass = pi.Agent;
+  } catch {
+    // Pi-Mono not available — stub fallback
+    AgentClass = undefined;
+  }
+  return AgentClass;
 }
 
 export interface PiMonoAgentConfig {
@@ -35,16 +43,17 @@ export interface PiMonoAgentConfig {
  * This creates the agent structure; the caller must set the model
  * before executing prompts.
  */
-export function createPiMonoAgent(config: PiMonoAgentConfig): any {
-  if (!AgentClass) {
+export async function createPiMonoAgent(config: PiMonoAgentConfig): Promise<any> {
+  const cls = await getAgentClass();
+  if (!cls) {
     return {
-      prompt: async () => "Pi-Mono not available",
+      prompt: async () => "Pi-Mono not available (package @earendil-works/pi-agent-core not installed)",
       subscribe: () => () => {},
       waitForIdle: async () => {},
     };
   }
 
-  const agent = new AgentClass({
+  const agent = new cls({
     initialState: {
       systemPrompt: config.systemPrompt,
     } as any,

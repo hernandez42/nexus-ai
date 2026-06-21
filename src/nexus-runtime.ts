@@ -40,7 +40,7 @@ export interface NexusResult {
 // Nexus Runtime
 // ============================================================
 
-export interface NexusConfig {
+export interface NexusRuntimeConfig {
   maxCycles: number;
   evolution: {
     populationSize: number;
@@ -56,12 +56,12 @@ export interface NexusConfig {
 }
 
 export class NexusRuntime {
-  private config: NexusConfig;
+  private config: NexusRuntimeConfig;
   private llm: LLMClient;
   private deconstruction: ContinuousDeconstruction;
   private evolution: EvolutionEngine;
 
-  constructor(config: NexusConfig, llm: LLMClient) {
+  constructor(config: NexusRuntimeConfig, llm: LLMClient) {
     this.config = config;
     this.llm = llm;
 

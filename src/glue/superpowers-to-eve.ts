@@ -1,17 +1,29 @@
 /**
- * Superpowers → Eve Glue (REAL INTEGRATION)
+ * Superpowers → Eve Glue
  *
  * Converts Superpowers coding methodology skills into Eve agent definitions.
- * Uses the real Eve `defineAgent` API instead of LLM simulation.
+ * Uses ESM-native imports. No CJS require(), no top-level await at module scope.
  */
 
-let defineAgentFn: typeof import("eve").defineAgent | undefined;
+import { readdirSync, readFileSync, existsSync } from "fs";
+import { join } from "path";
 
-try {
-  const eve = await import("eve");
-  defineAgentFn = eve.defineAgent;
-} catch {
-  // Eve not available — functions will use fallback
+// Attempt to load real Eve defineAgent lazily (runtime optional)
+let defineAgentFn: ((opts: { description: string; model?: unknown }) => unknown) | undefined = undefined;
+let eveTried = false;
+
+async function getDefineAgent(): Promise<typeof defineAgentFn> {
+  if (eveTried) return defineAgentFn;
+  eveTried = true;
+  try {
+    // Dynamic import — only runs if the caller actually needs it
+    const eve = await import("eve");
+    defineAgentFn = (eve as { defineAgent?: typeof defineAgentFn }).defineAgent;
+  } catch {
+    // Eve not installed — we just produce data structures
+    defineAgentFn = undefined;
+  }
+  return defineAgentFn;
 }
 
 export interface SuperpowersSkill {
@@ -23,19 +35,21 @@ export interface SuperpowersSkill {
 
 export interface EveAgent {
   name: string;
+  description: string;
   instructions: string;
-  tools?: string[];
+  tools: string[];
 }
 
 /**
- * Convert Superpowers skills to Eve agent definitions using real Eve API.
- *
- * Note: Eve's defineAgent requires a LanguageModel instance for the `model` field.
- * This function creates the agent definition structure; the caller must provide
- * the model instance before calling defineAgent.
+ * Convert Superpowers skills to Eve agent definitions (pure data transform).
  */
 export function superpowersToEve(skills: SuperpowersSkill[]): EveAgent[] {
   return skills.map(skill => {
+    const toolHints: string[] = [];
+    for (const s of skill.steps) {
+      const m = s.match(/(?:tool|function):\s*([A-Za-z0-9_-]+)/);
+      if (m) toolHints.push(m[1]);
+    }
     const instructions = [
       `# ${skill.name}`,
       skill.description,
@@ -47,73 +61,58 @@ export function superpowersToEve(skills: SuperpowersSkill[]): EveAgent[] {
 
     return {
       name: skill.name,
+      description: skill.description,
       instructions,
-      tools: skill.steps.filter(s => s.includes("tool:") || s.includes("function:")).map(s => s.split(":")[1].trim()),
+      tools: toolHints,
     };
   });
 }
 
 /**
- * Create a real Eve agent definition with a model.
- * Requires an AI SDK LanguageModel instance.
+ * Create an Eve agent using the real Eve defineAgent (if available).
  */
-export function createEveAgent(skill: SuperpowersSkill, model: any): any {
-  const instructions = [
-    `# ${skill.name}`,
-    skill.description,
-    "",
-    "## Steps",
-    ...skill.steps.map((s, i) => `${i + 1}. ${s}`),
-  ].join("\n");
-
-  // Use real Eve defineAgent with proper model, or fallback
-  if (defineAgentFn) {
-    return defineAgentFn({
-      description: skill.description,
-      model,
-    });
+export async function createEveAgent(
+  skill: SuperpowersSkill,
+  model?: unknown
+): Promise<unknown> {
+  const def = await getDefineAgent();
+  if (def) {
+    return def({ description: skill.description, model });
   }
-  // Fallback when Eve is not available
-  return {
-    name: skill.name,
-    description: skill.description,
-    instructions,
-    model,
-  };
+  // Fallback: return structured agent data
+  return superpowersToEve([skill])[0];
 }
 
 /**
  * Load Superpowers skills from a directory and convert to Eve agents.
  */
 export async function loadSuperpowersAndConvert(skillsDir: string): Promise<EveAgent[]> {
-  const { readdirSync, readFileSync, existsSync } = await import("fs");
-  const { join } = await import("path");
-
   if (!existsSync(skillsDir)) {
     return [];
   }
-
   const skills: SuperpowersSkill[] = [];
   const files = readdirSync(skillsDir).filter(f => f.endsWith(".json") || f.endsWith(".md"));
-
   for (const file of files) {
     try {
       const content = readFileSync(join(skillsDir, file), "utf-8");
       if (file.endsWith(".json")) {
         skills.push(JSON.parse(content));
       } else {
-        // Parse markdown skill format
         const lines = content.split("\n");
         const name = lines.find(l => l.startsWith("# "))?.slice(2) || file;
         const description = lines.slice(1).find(l => l.trim() && !l.startsWith("#")) || "";
-        const steps = lines.filter(l => l.match(/^\d+\./)).map(l => l.replace(/^\d+\.\s*/, ""));
+        const steps = lines
+          .filter(l => /^\d+\./.test(l))
+          .map(l => l.replace(/^\d+\.\s*/, ""));
         skills.push({ name, description, steps });
       }
     } catch (e: unknown) {
-      console.warn(`Failed to load skill ${file}:`, e instanceof Error ? e.message : String(e));
+      console.warn(
+        `[superpowers-to-eve] Failed to load skill ${file}:`,
+        e instanceof Error ? e.message : String(e)
+      );
     }
   }
-
   return superpowersToEve(skills);
 }
 
@@ -125,24 +124,18 @@ export interface SkillConversionResult {
 }
 
 /**
- * Convert all Superpowers skills in a directory to Eve agents.
- * @deprecated Use loadSuperpowersAndConvert instead
+ * Backward-compatible synchronous entry point — returns [] when nothing found.
+ * @deprecated Use loadSuperpowersAndConvert instead (async).
  */
 export function convertAllSkills(skillsDir: string, _outputDir: string): SkillConversionResult[] {
-  const { existsSync } = require("fs");
-  if (!existsSync(skillsDir)) {
-    return [];
-  }
-  // This is a synchronous wrapper for backward compatibility
-  // In practice, the async loadSuperpowersAndConvert should be used
-  return [];
+  if (!existsSync(skillsDir)) return [];
+  return []; // Intentionally a stub — use async version for real conversion.
 }
 
 /**
- * Generate a skill index markdown file.
- * @deprecated Index generation is now handled by Eve's defineAgent
+ * Backward-compatible stub.
+ * @deprecated Indexing handled by Eve if available.
  */
 export function generateSkillIndex(_results: SkillConversionResult[], _outputPath: string): void {
-  // Eve's defineAgent handles indexing internally
-  // This function is kept for backward compatibility
+  // Intentionally a no-op.
 }
