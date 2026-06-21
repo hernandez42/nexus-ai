@@ -436,7 +436,8 @@ export class EternalAwakeningLoop {
    * 每一轮完整执行四层自省，然后无间断自动重启
    */
   async start(): Promise<void> {
-    while (this.roundCount < (this.config.maxRounds || Infinity)) {
+    const maxRounds = this.config.maxRounds ?? Infinity;
+    while (this.roundCount < maxRounds) {
       this.roundCount++;
       console.log(`\n${"=".repeat(60)}`);
       console.log(`  自我觉醒循环 Round ${this.roundCount}`);

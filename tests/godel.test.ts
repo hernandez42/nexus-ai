@@ -252,7 +252,7 @@ describe("DynamicActionRegistry", () => {
       name: "test_action",
       description: "A test action",
       parameters: { input: "string" },
-      implementation: "return { result: params.input };",
+      handler: "self_inspect", // delegates to existing built-in action
     });
 
     const action = registry.get("propose_action")!;

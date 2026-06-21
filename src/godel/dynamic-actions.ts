@@ -50,8 +50,9 @@ export class DynamicActionRegistry {
   }
 
   /**
-   * Propose a new action based on current needs
-   * The LLM generates action code, which is then registered
+   * Propose a new action based on current needs.
+   * SECURITY: Never execute LLM-generated code. Actions are composed
+   * from existing tools and registered handlers only.
    */
   async proposeAction(
     need: string,
@@ -68,32 +69,29 @@ Design a new action as JSON:
   "name": "action_name",
   "description": "What this action does",
   "parameters": { "param1": "string", "param2": "number?" },
-  "implementation": "JavaScript code using params and context"
+  "handler": "one of: self_inspect | interact | memory_query | memory_write | evolve | deconstruct | awaken"
 }
 
-The implementation should use:
-- params: the parameters object
-- context.introspection: to inspect agent state
-- context.toolRegistry: to use existing tools
-- context.memory: to read/write memory
-- context.llmCall: to call the LLM
-- context.state: shared mutable state
-
+The handler determines which built-in capability this action delegates to.
 Return ONLY valid JSON.`;
 
     const response = await llmCall([{ role: "user", content: prompt }]);
     try {
       const parsed = JSON.parse(response);
-      if (!parsed.name || !parsed.implementation) return null;
+      if (!parsed.name || !parsed.handler) return null;
 
-      // Create a safe function from the implementation string
-      const fn = new Function("params", "context", parsed.implementation);
+      // SECURITY: Only allow delegation to existing built-in actions
+      const delegate = this.get(parsed.handler);
+      if (!delegate) {
+        console.warn(`[DynamicAction] Rejected unknown handler: ${parsed.handler}`);
+        return null;
+      }
 
       const action: Action = {
         name: parsed.name,
-        description: parsed.description || `Dynamically proposed action: ${parsed.name}`,
+        description: parsed.description || `Composed action: ${parsed.name} → ${parsed.handler}`,
         parameters: parsed.parameters || {},
-        execute: async (params, context) => fn(params, context),
+        execute: delegate.execute,
       };
 
       this.register(action);
