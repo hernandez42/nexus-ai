@@ -359,6 +359,16 @@ async function runCycle(
 
   systemPrompt += memoryContext;
 
+  // Critical: tell LLM when to stop calling tools and reply directly
+  systemPrompt += `
+
+IMPORTANT INSTRUCTIONS:
+- You have tools available. Use them ONLY when needed to answer the user's question.
+- After using tools and getting results, STOP calling tools and reply directly to the user with your answer.
+- Do NOT keep calling tools endlessly. After 1-3 tool calls, you MUST reply with your final answer.
+- If you already have enough information to answer, reply with text instead of calling more tools.
+- Reply in the same language as the user's question (Chinese → Chinese, English → English).`;
+
   if (selfModel) {
     systemPrompt += `\n\n[SELF-AWARENESS]\n我是谁: ${selfModel.consciousness.whoAmI.slice(0, 200)}`;
   }
@@ -490,7 +500,7 @@ async function runCycle(
       userPrompt: prompt,
       tools: toolDefs,
       llm,
-      maxSteps: 10,
+      maxSteps: 5,
       onStream: streamCallback,
     });
 
@@ -695,31 +705,8 @@ async function runCycle(
   console.log(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
   console.log(`Logs: ${config.logDir}`);
 
-  // Return formatted result for Lark / external callers
-  const outputLines = [
-    `**Final Answer**: ${result.finalAnswer.slice(0, 500)}`,
-    ``,
-    `Iterations: ${result.iterations} | Steps: ${result.steps.length}`,
-    `Goals: ${result.goals.length} | Capabilities: ${result.newCapabilities.length}`,
-    `Breakthroughs: ${breakthroughs.length} | Species: ${species.map(s => s.archetype).join(", ") || "none"}`,
-    `Memory: ${memStats.total} total (${memStats.episodic} episodic, ${memStats.semantic} semantic, ${memStats.procedural} procedural)`,
-  ];
-
-  if (result.newCapabilities.length > 0) {
-    outputLines.push("", "**New Capabilities**:");
-    for (const cap of result.newCapabilities) {
-      outputLines.push(`- ${cap.name}: ${cap.description.slice(0, 100)}`);
-    }
-  }
-
-  if (result.goals.length > 0) {
-    outputLines.push("", "**Goals**:");
-    for (const goal of result.goals) {
-      outputLines.push(`- ${goal.target} (priority ${goal.priority}): ${goal.reason.slice(0, 100)}`);
-    }
-  }
-
-  return outputLines.join("\n");
+  // Return the final answer directly — user wants the answer, not internal stats
+  return result.finalAnswer;
 }
 
 async function runGlue(config: any, log: Logger) {
