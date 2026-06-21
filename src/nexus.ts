@@ -63,7 +63,7 @@ async function main() {
   const skipGlue = args.includes("--skip-glue");
   const skipDeconstruct = args.includes("--skip-deconstruct");
   const skipSelfAwareness = args.includes("--skip-self-awareness");
-  const prompt = args.find(a => !a.startsWith("--")) || "Analyze the autoresearch codebase and tell me what model architecture it uses.";
+  const prompt = args.find(a => !a.startsWith("--")) || "Perform a self-assessment: review your current memory, capabilities, and evolutionary state. Report your findings concisely.";
 
   if (initConfig) {
     generateDefaultConfig(configPath);

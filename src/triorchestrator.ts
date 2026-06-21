@@ -482,14 +482,14 @@ export class GEPEngine {
 
       if (matchedGene) {
         const capability = await this.evolveCapability(matchedGene, exp);
-        if (capability && !seenNames.has(capability.name)) {
-          seenNames.add(capability.name);
+        if (capability && !this.isDuplicateCapability(capability.name, seenNames)) {
+          seenNames.add(capability.name.toLowerCase().replace(/[_\s-]/g, ""));
           newCapabilities.push(capability);
         }
       } else if (signals.length > 0) {
         const capability = await this.evolveGenericCapability(signals, exp);
-        if (capability && !seenNames.has(capability.name)) {
-          seenNames.add(capability.name);
+        if (capability && !this.isDuplicateCapability(capability.name, seenNames)) {
+          seenNames.add(capability.name.toLowerCase().replace(/[_\s-]/g, ""));
           newCapabilities.push(capability);
         }
       }
@@ -497,6 +497,20 @@ export class GEPEngine {
 
     this.capabilities.push(...newCapabilities);
     return newCapabilities;
+  }
+
+  /**
+   * Case-insensitive + fuzzy dedup: normalizes name by lowercasing
+   * and stripping underscores/spaces/hyphens before comparison.
+   */
+  private isDuplicateCapability(name: string, seen: Set<string>): boolean {
+    const normalized = name.toLowerCase().replace(/[_\s-]/g, "");
+    if (seen.has(normalized)) return true;
+    // Fuzzy: check if any seen name is a substring (or vice versa) > 80% match
+    for (const s of seen) {
+      if (normalized.includes(s) || s.includes(normalized)) return true;
+    }
+    return false;
   }
 
   private matchGene(signals: string[]): Gene | null {
