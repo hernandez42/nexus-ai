@@ -10,8 +10,28 @@
  */
 
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
 }
 
 export interface LLMConfig {
@@ -26,7 +46,13 @@ export interface LLMConfig {
 
 export interface LLMClient {
   chat(messages: ChatMessage[]): Promise<string>;
+  chatWithTools?(messages: ChatMessage[], tools: ToolDefinition[]): Promise<ToolCallResult>;
   chatStream?(messages: ChatMessage[]): AsyncIterable<string>;
+}
+
+export interface ToolCallResult {
+  content: string | null;
+  toolCalls: ToolCall[] | null;
 }
 
 // ============================================================
@@ -240,6 +266,57 @@ function createOpenAIClient(config: LLMConfig): LLMClient {
         }
       }
 
+      throw lastError || new Error("All API keys exhausted");
+    },
+
+    async chatWithTools(messages, tools) {
+      await globalRateLimiter.acquire();
+
+      let lastError: Error | undefined;
+      for (let ki = 0; ki < keys.length; ki++) {
+        const apiKey = keys[ki];
+        try {
+          const response = await fetch(`${baseURL}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              messages: messages.map(m => {
+                const msg: Record<string, unknown> = { role: m.role, content: m.content };
+                if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+                if (m.tool_calls) msg.tool_calls = m.tool_calls;
+                return msg;
+              }),
+              tools: tools.length > 0 ? tools : undefined,
+              temperature: config.temperature ?? 0.7,
+              max_tokens: config.maxTokens ?? 4096,
+            }),
+          });
+
+          if (!response.ok) {
+            const err = await response.text();
+            if ([401, 429, 500, 502, 503, 504].includes(response.status) && ki < keys.length - 1) {
+              console.warn(`[LLM] Key ${ki + 1}/${keys.length} got ${response.status}, trying next`);
+              continue;
+            }
+            throw new Error(`LLM API error ${response.status}: ${err}`);
+          }
+
+          const data = await response.json() as any;
+          const choice = data.choices?.[0];
+          const msg = choice?.message as any;
+          return {
+            content: msg?.content || null,
+            toolCalls: msg?.tool_calls || null,
+          };
+        } catch (e: unknown) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+          if (ki < keys.length - 1) continue;
+        }
+      }
       throw lastError || new Error("All API keys exhausted");
     },
 
