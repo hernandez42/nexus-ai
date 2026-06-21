@@ -11,7 +11,7 @@
  * 进化/解构/觉醒只在 daemon 模式后台运行，不阻塞飞书消息处理。
  */
 
-import { mkdirSync, readFileSync, existsSync } from "fs";
+import { mkdirSync, readFileSync, existsSync, statSync } from "fs";
 import { join } from "path";
 import { spawnSync } from "child_process";
 import { loadConfig, generateDefaultConfig } from "./config";
@@ -389,12 +389,19 @@ function buildToolSet(config: any): Array<{
   if (!toolNames.has("read_file")) {
     tools.push({
       name: "read_file",
-      description: "Read contents of a file. Returns first 2000 characters.",
+      description: "Read contents of a file. Only works on files — use list_dir for directories. Returns first 2000 characters.",
       parameters: { path: "string" },
       execute: async (params: Record<string, unknown>) => {
-        const path = params.path as string;
-        if (!existsSync(path)) return { error: "File not found" };
-        return { content: readFileSync(path, "utf-8").slice(0, 2000) };
+        try {
+          const path = params.path as string;
+          if (!path) return { error: "Parameter 'path' is required" };
+          if (!existsSync(path)) return { error: `File not found: ${path}` };
+          const stats = statSync(path);
+          if (stats.isDirectory()) return { error: `Path is a directory, not a file: ${path}. Use list_dir instead.` };
+          return { content: readFileSync(path, "utf-8").slice(0, 2000) };
+        } catch (e: unknown) {
+          return { error: `read_file failed: ${e instanceof Error ? e.message : String(e)}` };
+        }
       },
     });
   }
@@ -406,7 +413,13 @@ function buildToolSet(config: any): Array<{
       parameters: { command: "string" },
       execute: async (params: Record<string, unknown>) => {
         try {
-          const result = spawnSync("sh", ["-c", params.command as string], {
+          const cmd = params.command as string;
+          if (!cmd) return { error: "Parameter 'command' is required" };
+          const blocked = [/rm\s+-rf\s+\/\s*$/, /sudo\b/, /mkfs\b/, /\bdd\b.*of=\/dev/];
+          for (const pattern of blocked) {
+            if (pattern.test(cmd)) return { error: "Command blocked by security policy" };
+          }
+          const result = spawnSync("sh", ["-c", cmd], {
             encoding: "utf-8", timeout: 15000, maxBuffer: 2 * 1024 * 1024,
           });
           return { output: (result.stdout || "").slice(0, 2000) + (result.stderr ? "\n" + (result.stderr as string).slice(0, 500) : "") };
@@ -425,6 +438,7 @@ function buildToolSet(config: any): Array<{
       execute: async (params: Record<string, unknown>) => {
         try {
           const dir = (params.directory as string) || ".";
+          if (!existsSync(dir) || !statSync(dir).isDirectory()) return { error: `Directory not found or not a directory: ${dir}` };
           const result = spawnSync("find", [dir, "-name", params.pattern as string, "-type", "f"], {
             encoding: "utf-8", timeout: 10000,
           });
@@ -445,7 +459,9 @@ function buildToolSet(config: any): Array<{
       execute: async (params: Record<string, unknown>) => {
         try {
           const args = ["-rn", params.pattern as string];
-          if (params.path) args.push(params.path as string);
+          const searchPath = (params.path as string) || ".";
+          if (!existsSync(searchPath)) return { error: `Path not found: ${searchPath}` };
+          args.push(searchPath);
           const result = spawnSync("grep", args, {
             encoding: "utf-8", timeout: 10000, maxBuffer: 1024 * 1024,
           });

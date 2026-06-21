@@ -54,7 +54,7 @@ export interface ToolLoopConfig {
   userPrompt: string;
   tools: ToolDef[];
   llm: LLMClient;
-  maxSteps?: number; // default 10
+  maxSteps?: number; // default 5
   onStream?: (chunk: string) => void;
 }
 
@@ -65,7 +65,7 @@ export interface ToolLoopResult {
 }
 
 export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResult> {
-  const { systemPrompt, userPrompt, tools, llm, maxSteps = 10, onStream } = config;
+  const { systemPrompt, userPrompt, tools, llm, maxSteps = 5, onStream } = config;
 
   // Build OpenAI tool definitions
   const toolDefinitions: ToolDefinition[] = tools.map(t => ({

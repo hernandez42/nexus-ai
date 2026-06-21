@@ -51,43 +51,72 @@ export class ToolRegistry {
     // File system (1-4)
     this.register({
       name: "read_file",
-      description: "Read contents of a file",
+      description: "Read contents of a file. Only works on files — use list_dir for directories.",
       parameters: { path: "string", offset: "number?", limit: "number?" },
       execute: async (p) => {
-        const path = p.path as string;
-        if (!existsSync(path)) return { error: "File not found" };
-        const content = readFileSync(path, "utf-8");
-        const offset = (p.offset as number) || 0;
-        const limit = (p.limit as number) || 2000;
-        return { content: content.slice(offset, offset + limit), totalLength: content.length };
+        try {
+          const path = p.path as string;
+          if (!path) return { error: "Parameter 'path' is required" };
+          if (!existsSync(path)) return { error: `File not found: ${path}` };
+          const stats = statSync(path);
+          if (stats.isDirectory()) return { error: `Path is a directory, not a file: ${path}. Use list_dir instead.` };
+          if (!stats.isFile()) return { error: `Path is not a regular file: ${path}` };
+          const content = readFileSync(path, "utf-8");
+          const offset = Math.max(0, (p.offset as number) || 0);
+          const limit = Math.max(1, Math.min(10000, (p.limit as number) || 2000));
+          return { content: content.slice(offset, offset + limit), totalLength: content.length, offset, limit };
+        } catch (e: unknown) {
+          return { error: `read_file failed: ${e instanceof Error ? e.message : String(e)}` };
+        }
       },
     });
 
     this.register({
       name: "write_file",
-      description: "Write content to a file (creates dirs if needed)",
+      description: "Write content to a file (creates parent dirs if needed)",
       parameters: { path: "string", content: "string", append: "boolean?" },
       execute: async (p) => {
-        const path = p.path as string;
-        mkdirSync(dirname(path), { recursive: true });
-        if (p.append) writeFileSync(path, p.content as string, { flag: "a" });
-        else writeFileSync(path, p.content as string);
-        return { success: true, bytes: (p.content as string).length };
+        try {
+          const path = p.path as string;
+          if (!path) return { error: "Parameter 'path' is required" };
+          sanitizePath(path);
+          const parent = dirname(path);
+          if (parent && parent !== "." && parent !== "/") mkdirSync(parent, { recursive: true });
+          else mkdirSync(".", { recursive: true });
+          if (p.append) writeFileSync(path, p.content as string, { flag: "a" });
+          else writeFileSync(path, p.content as string);
+          return { success: true, bytes: (p.content as string).length, path };
+        } catch (e: unknown) {
+          return { error: `write_file failed: ${e instanceof Error ? e.message : String(e)}` };
+        }
       },
     });
 
     this.register({
       name: "list_dir",
-      description: "List files and directories",
+      description: "List files and subdirectories in a directory",
       parameters: { path: "string", recursive: "boolean?" },
       execute: async (p) => {
-        const path = p.path as string;
-        if (!existsSync(path)) return { error: "Directory not found" };
-        const entries = readdirSync(path);
-        return {
-          files: entries.filter(e => statSync(join(path, e)).isFile()),
-          dirs: entries.filter(e => statSync(join(path, e)).isDirectory()),
-        };
+        try {
+          const path = (p.path as string) || ".";
+          sanitizePath(path);
+          if (!existsSync(path)) return { error: `Directory not found: ${path}` };
+          const stats = statSync(path);
+          if (!stats.isDirectory()) return { error: `Path is not a directory: ${path}. Use read_file instead.` };
+          const entries = readdirSync(path);
+          let files: string[] = [];
+          let dirs: string[] = [];
+          for (const e of entries) {
+            try {
+              const s = statSync(join(path, e));
+              if (s.isDirectory()) dirs.push(e);
+              else if (s.isFile()) files.push(e);
+            } catch { /* broken symlinks, etc — skip */ }
+          }
+          return { files: files.slice(0, 200), dirs: dirs.slice(0, 200) };
+        } catch (e: unknown) {
+          return { error: `list_dir failed: ${e instanceof Error ? e.message : String(e)}` };
+        }
       },
     });
 
