@@ -185,6 +185,28 @@ function withRetry(
     },
 
     chatStream: client.chatStream,
+    chatWithTools: client.chatWithTools
+      ? async (messages, tools) => {
+          const MAX_TOTAL_CHARS = 80000;
+          const truncated = truncateMessages(messages, MAX_TOTAL_CHARS);
+          let lastError: Error | undefined;
+          for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+            try {
+              return await client.chatWithTools!(truncated, tools);
+            } catch (e: unknown) {
+              lastError = e instanceof Error ? e : new Error(String(e));
+              const isRetryable = cfg.retryableStatuses.some(status =>
+                lastError!.message.includes(String(status))
+              ) || lastError.message.includes("timeout") || lastError.message.includes("ECONNRESET");
+              if (!isRetryable || attempt === cfg.maxRetries) throw lastError;
+              const delay = Math.min(cfg.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000, cfg.maxDelayMs);
+              console.warn(`[LLM] chatWithTools retry ${attempt + 1}/${cfg.maxRetries} after ${Math.round(delay)}ms`);
+              await sleep(delay);
+            }
+          }
+          throw lastError;
+        }
+      : undefined,
   };
 }
 
