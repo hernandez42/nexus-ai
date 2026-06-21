@@ -322,18 +322,30 @@ Respond with JSON:
     const lower = text.toLowerCase();
 
     const patterns: Array<[string[], string]> = [
+      // Error signals
       [["error", "exception", "failed", "fail", "crash"], "error_detected"],
       [["not found", "missing", "absent", "no tool"], "missing_capability"],
       [["timeout", "slow", "hang", "stuck"], "performance_issue"],
       [["unknown", "unclear", "confused", "don't understand", "don't fully understand", "don't know", "not sure", "knowledge gap"], "knowledge_gap"],
       [["oom", "out of memory", "memory"], "resource_limit"],
       [["can't resolve", "can't solve", "unable to", "need to understand"], "knowledge_gap"],
+      // Curiosity signals — always trigger exploration
+      [["analyze", "investigate", "explore", "understand", "learn"], "curiosity_analysis"],
+      [["how", "why", "what if", "what is", "could be", "might be"], "curiosity_question"],
+      [["architecture", "pattern", "design", "structure", "system"], "architecture_insight"],
+      [["improve", "optimize", "enhance", "better", "refactor"], "improvement_opportunity"],
+      [["compare", "different", "alternative", "instead", "another way"], "exploration_alternative"],
     ];
 
     for (const [keywords, signal] of patterns) {
       if (keywords.some(k => lower.includes(k))) {
         signals.push(signal);
       }
+    }
+
+    // Always add a generic exploration signal if there's any meaningful content
+    if (text.length > 50 && signals.length === 0) {
+      signals.push("exploration_opportunity");
     }
 
     return signals;
@@ -369,11 +381,22 @@ export class CuriosityDrivenExplorer {
 
     // 使用 LLM 分析信号，生成探索目标 — 强制 JSON
     const analysisRaw = await this.llmCall([
-      { role: "system", content: "You are a curiosity-driven explorer. Respond with JSON only." },
-      { role: "user", content: `Signals detected: ${uniqueSignals.join(", ")}\n\nReasoning steps:\n${steps.map(s => `[${s.type}] ${s.content.slice(0, 150)}`).join("\n")}\n\nWhat knowledge gaps or missing capabilities should be explored?\n\nRespond with JSON array:\n[{"target": "capability name", "reason": "why needed", "priority": 8}]` },
+      { role: "system", content: "You are a curiosity-driven explorer. Your job is to find what to learn next. Respond with JSON only." },
+      { role: "user", content: `Signals detected: ${uniqueSignals.join(", ")}\n\nReasoning steps:\n${steps.map(s => `[${s.type}] ${s.content.slice(0, 150)}`).join("\n")}\n\nWhat should the agent explore or learn next? Identify knowledge gaps, missing capabilities, or areas where deeper understanding would help.\n\nRespond with JSON array (can be empty):\n[{"target": "capability name", "reason": "why needed", "priority": 8}]` },
     ]);
 
-    return this.parseGoalsJSON(analysisRaw, steps.length);
+    const goals = this.parseGoalsJSON(analysisRaw, steps.length);
+    // Fallback: if LLM returned nothing but we have signals, create a generic goal
+    if (goals.length === 0 && uniqueSignals.length > 0) {
+      goals.push({
+        id: `goal_0`,
+        target: `explore_${uniqueSignals[0]}`,
+        reason: `Signal "${uniqueSignals[0]}" detected during reasoning — warrants deeper exploration`,
+        priority: 5,
+        sourceStep: steps.length,
+      });
+    }
+    return goals;
   }
 
   private parseGoals(text: string, maxStep: number): ExplorationGoal[] {
@@ -498,18 +521,18 @@ export class GEPEngine {
   }
 
   private async evolveCapability(gene: Gene, exp: Experience): Promise<Capability | null> {
-    const prompt = `Based on this Gene strategy and the failed experience, design a new agent capability.
+    const prompt = `Based on this Gene strategy and the experience, design a new agent capability.
 
 Gene: ${gene.id}
 Category: ${gene.category}
 Strategy:
 ${gene.strategy.map((s, i) => `${i + 1}. ${s}`).join("\n")}
 
-Failed experience:
+Experience (outcome: ${exp.outcome}):
 Prompt: ${exp.prompt}
 Steps: ${exp.steps.map(s => `[${s.type}] ${s.content.slice(0, 100)}`).join("\n")}
 
-Respond with JSON:
+Respond with VALID JSON ONLY. No markdown, no other text:
 {"name": "short_identifier", "description": "what it does", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
 
     const response = await this.llmCall([
@@ -523,13 +546,13 @@ Respond with JSON:
   private async evolveGenericCapability(signals: string[], exp: Experience): Promise<Capability | null> {
     const prompt = `The agent encountered these signals during reasoning: ${signals.join(", ")}.
 
-Failed experience:
+Experience (outcome: ${exp.outcome}):
 Prompt: ${exp.prompt}
 Steps: ${exp.steps.map(s => `[${s.type}] ${s.content.slice(0, 100)}`).join("\n")}
 
 No specific Gene matched these signals. Design a new general-purpose capability to handle this type of situation.
 
-Respond with JSON:
+Respond with VALID JSON ONLY. No markdown, no other text:
 {"name": "short_identifier", "description": "what it does", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
 
     const response = await this.llmCall([
@@ -698,36 +721,40 @@ export class TriOrchestrator {
       this.learner.record(experience);
 
       if (finalStep) {
-        console.log("[Round 1] Final answer reached.");
-        break;
+        console.log("[Round 1] Final answer reached. Proceeding to explore/evolve anyway.");
       }
 
-      // Round 2: 探索
+      // Round 2: 探索（无论是否出 FINAL 都跑）
       console.log("[Round 2] Exploring...");
       const goals = await this.explorer.explore(steps);
       allGoals.push(...goals);
 
-      if (goals.length === 0) {
-        console.log("[Round 2] No exploration goals. Stopping.");
-        break;
+      if (goals.length > 0) {
+        console.log(`[Round 2] Found ${goals.length} goals: ${goals.map(g => g.target).join(", ")}`);
+      } else {
+        console.log("[Round 2] No exploration goals.");
       }
-      console.log(`[Round 2] Found ${goals.length} goals: ${goals.map(g => g.target).join(", ")}`);
 
-      // Round 3: 进化
+      // Round 3: 进化（无论是否有 goals 都跑）
       console.log("[Round 3] Evolving...");
       const recentExperiences = this.learner.getRecent(5);
       const newCapabilities = await this.gep.runCycle(recentExperiences);
       allCapabilities.push(...newCapabilities);
 
-      if (newCapabilities.length === 0) {
-        console.log("[Round 3] No new capabilities evolved. Stopping.");
+      if (newCapabilities.length > 0) {
+        console.log(`[Round 3] Evolved ${newCapabilities.length} new capabilities: ${newCapabilities.map(c => c.name).join(", ")}`);
+        // 有新能力 → 更新 prompt，下一轮带新知识
+        currentPrompt = prompt + "\n\n[New capabilities available]: " +
+          newCapabilities.map(c => `${c.name}: ${c.description}`).join("; ");
+      } else {
+        console.log("[Round 3] No new capabilities evolved.");
+      }
+
+      // 终止条件：没有新目标 AND 没有新能力 → 不再迭代
+      if (goals.length === 0 && newCapabilities.length === 0) {
+        console.log("No new goals or capabilities. Stopping.");
         break;
       }
-      console.log(`[Round 3] Evolved ${newCapabilities.length} new capabilities: ${newCapabilities.map(c => c.name).join(", ")}`);
-
-      // 准备下一轮：将新能力注入 prompt
-      currentPrompt = prompt + "\n\n[New capabilities available]: " +
-        newCapabilities.map(c => `${c.name}: ${c.description}`).join("; ");
     }
 
     const finalStep = allSteps.find(s => s.type === "FINAL");
