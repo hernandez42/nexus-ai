@@ -752,8 +752,23 @@ export class TriOrchestrator {
   constructor(config: TriOrchestratorConfig) {
     this.config = config;
     this.learner = new ExperienceLearner(config.memoryDir);
+    // Build system prompt with tool descriptions — LLM decides what to use
+    const toolDescriptions = config.tools.map(t =>
+      `- ${t.name}: ${t.description}`
+    ).join("\n");
+    const enhancedSystemPrompt = config.systemPrompt + `
+
+You have access to the following tools. Use them when needed to complete the user's request:
+${toolDescriptions}
+
+When you need to use a tool, respond with JSON:
+{"action": "tool_name", "params": {"key": "value"}}
+
+When you have enough information to answer, respond with:
+{"done": true, "final_answer": "your answer"}`;
+
     this.reasoner = new AgentReasoningEngine({
-      systemPrompt: config.systemPrompt,
+      systemPrompt: enhancedSystemPrompt,
       maxSteps: config.maxReasoningSteps,
       tools: config.tools,
       llmCall: config.llmCall,
