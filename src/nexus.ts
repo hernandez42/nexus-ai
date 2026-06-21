@@ -490,6 +490,7 @@ async function runCycle(
 
     const result = await runToolLoop({
       systemPrompt,
+      userPrompt: prompt,
       tools: toolDefs,
       llm,
       maxSteps: 10,

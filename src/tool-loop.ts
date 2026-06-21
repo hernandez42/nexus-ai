@@ -24,6 +24,7 @@ export interface ToolDef {
 
 export interface ToolLoopConfig {
   systemPrompt: string;
+  userPrompt: string;
   tools: ToolDef[];
   llm: LLMClient;
   maxSteps?: number; // default 10
@@ -37,7 +38,7 @@ export interface ToolLoopResult {
 }
 
 export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResult> {
-  const { systemPrompt, tools, llm, maxSteps = 10, onStream } = config;
+  const { systemPrompt, userPrompt, tools, llm, maxSteps = 10, onStream } = config;
 
   // Build OpenAI tool definitions
   const toolDefinitions: ToolDefinition[] = tools.map(t => ({
@@ -49,9 +50,10 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
     },
   }));
 
-  // Build initial messages
+  // Build initial messages: system + user query
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
   ];
 
   const steps: ToolLoopResult["steps"] = [];
