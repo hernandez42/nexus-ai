@@ -551,11 +551,17 @@ Experience (outcome: ${exp.outcome}):
 Prompt: ${exp.prompt}
 Steps: ${exp.steps.map(s => `[${s.type}] ${s.content.slice(0, 100)}`).join("\n")}
 
+RULES:
+- name must be a CONCRETE action: read_X, search_Y, validate_Z, parse_W
+- NO abstract names like "dynamic_synthesis" or "meta_cognitive_resolver"
+- name must reference an actual tool or data source
+- description must say WHAT it does, not HOW (no "through deep semantic analysis")
+
 Respond with VALID JSON ONLY. No markdown, no other text:
-{"name": "short_identifier", "description": "what it does", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
+{"name": "concrete_action_name", "description": "what it does concretely", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
 
     const response = await this.llmCall([
-      { role: "system", content: "You are a genetic evolution engine. Respond with JSON only." },
+      { role: "system", content: "You are a genetic evolution engine. Generate CONCRETE capability names only. Respond with JSON only." },
       { role: "user", content: prompt },
     ]);
 
@@ -571,11 +577,17 @@ Steps: ${exp.steps.map(s => `[${s.type}] ${s.content.slice(0, 100)}`).join("\n")
 
 No specific Gene matched these signals. Design a new general-purpose capability to handle this type of situation.
 
+RULES:
+- name must be a CONCRETE action: read_X, search_Y, validate_Z, parse_W
+- NO abstract names like "dynamic_synthesis" or "meta_cognitive_resolver"
+- name must reference an actual tool or data source
+- description must say WHAT it does, not HOW
+
 Respond with VALID JSON ONLY. No markdown, no other text:
-{"name": "short_identifier", "description": "what it does", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
+{"name": "concrete_action_name", "description": "what it does concretely", "tools": ["tool1", "tool2"], "strategy": ["step 1", "step 2"], "validation": ["verify command 1"]}`;
 
     const response = await this.llmCall([
-      { role: "system", content: "You are a genetic evolution engine. Respond with JSON only." },
+      { role: "system", content: "You are a genetic evolution engine. Generate CONCRETE capability names only. Respond with JSON only." },
       { role: "user", content: prompt },
     ]);
 
@@ -586,6 +598,21 @@ Respond with VALID JSON ONLY. No markdown, no other text:
     try {
       const parsed = JSON.parse(text);
       if (!parsed.name) return null;
+
+      const name = String(parsed.name).toLowerCase().replace(/[_\s-]/g, "");
+
+      // Anti-bullshit filter: reject capability names with empty buzzwords
+      if (this.isBullshitName(name)) {
+        console.log(`[GEP] Rejected bullshit capability: ${parsed.name}`);
+        return null;
+      }
+
+      // Name must be <= 40 chars and contain at least one concrete verb/noun
+      if (name.length > 40) {
+        console.log(`[GEP] Rejected overly long capability: ${parsed.name}`);
+        return null;
+      }
+
       return {
         id: `cap_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         name: String(parsed.name),
@@ -599,6 +626,47 @@ Respond with VALID JSON ONLY. No markdown, no other text:
     } catch {
       return this.parseCapability(text);
     }
+  }
+
+  /**
+   * Anti-bullshit filter for capability names.
+   * Rejects names composed entirely of abstract buzzwords with no concrete action.
+   */
+  private isBullshitName(name: string): boolean {
+    // Buzzword patterns that indicate empty/abstract capabilities
+    const buzzwords = [
+      "alchemy", "resonance", "synthesis", "harmonization", "orchestration",
+      "transcend", "emergent", "paradigm", "synergy", "holistic",
+      "consciousness", "awareness", "autonomous", "dynamic",
+      "meta_cognitive", "metacognitive", "recursive", "selfreferential",
+      "chromatic", "kinetic", "vocal", "neural", "quantum",
+      "semantic_reconstruction", "logical_alchemy", "autonomous_consciousness",
+      "high_dimensional", "deep_semantic", "dynamic_reasoning",
+      "persona_synthesis", "intent_reconstruction", "signal_resilience",
+      "loop_neutralizer", "identity_resolver", "state_resolver",
+      "greeting", "social_initiation", "conversational_state",
+      "contextual_identity", "standard_greeting", "greeting_response",
+      "greeting_identity", "autonomous_intent", "capability_genesis",
+    ];
+
+    // Check if name is composed entirely of buzzwords
+    const buzzCount = buzzwords.filter(bw => name.includes(bw)).length;
+    if (buzzCount >= 1 && name.length < 15) return true;
+
+    // Reject if name contains 2+ buzzwords (definitely bullshit)
+    if (buzzCount >= 2) return true;
+
+    // Reject generic handler patterns
+    if (/handler$/.test(name) && buzzCount >= 1) return true;
+    if (/resolver$/.test(name) && buzzCount >= 1) return true;
+    if (/responder$/.test(name) && buzzCount >= 1) return true;
+
+    // Reject names that are just "verb_noun" with no concrete tool reference
+    // Concrete capabilities reference actual tools or data: read_file, search_code, bash_exec
+    const concretePrefixes = ["read", "write", "search", "bash", "grep", "find", "diff", "http", "fetch", "parse", "validate", "test"];
+    if (!concretePrefixes.some(p => name.includes(p)) && buzzCount >= 1) return true;
+
+    return false;
   }
 
   private parseCapability(text: string): Capability | null {
