@@ -469,15 +469,12 @@ async function runCycle(
   }
   const runToolLoopReasoning = async (): Promise<string> => {
     // Build tool definitions for OpenAI function calling
+    // Use the tool's original parameters (e.g. {path: "string", command: "string"})
+    // tool-loop.ts will convert them to OpenAI JSON Schema via convertParamsToOpenAI()
     const toolDefs = tools.map(t => ({
       name: t.name,
       description: t.description,
-      parameters: {
-        type: "object",
-        properties: {
-          input: { type: "string", description: "Input parameter" },
-        },
-      },
+      parameters: t.parameters,
       execute: async (params: Record<string, unknown>) => {
         try {
           const raw = await t.execute(params);
