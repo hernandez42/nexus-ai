@@ -129,11 +129,12 @@ async function main() {
 
     await startLarkBot(
       { appId: larkAppId, appSecret: larkAppSecret, allowFrom },
-      async (text, sender) => {
+      async (text, sender, onProgress) => {
         console.log(`[Lark] Processing message: ${text.slice(0, 100)}`);
         try {
           const result = await runCycle(config, log, memory, {
             skipGlue, skipDeconstruct, skipSelfAwareness, prompt: text,
+            onProgress,
           });
           return result;
         } catch (e: unknown) {
@@ -209,10 +210,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 interface CycleOptions {
-  skipGlue: boolean;
-  skipDeconstruct: boolean;
-  skipSelfAwareness: boolean;
+  skipGlue?: boolean;
+  skipDeconstruct?: boolean;
+  skipSelfAwareness?: boolean;
   prompt: string;
+  onProgress?: (chunk: string) => void;
 }
 
 async function runCycle(
@@ -221,7 +223,7 @@ async function runCycle(
   memory: MemoryStore,
   options: CycleOptions
 ): Promise<string> {
-  const { skipGlue, skipDeconstruct, skipSelfAwareness, prompt } = options;
+  const { skipGlue, skipDeconstruct, skipSelfAwareness, prompt, onProgress } = options;
 
   const pastMemories = memory.query({ text: prompt, topK: 5, minSimilarity: 0.01 });
   const memoryContext = pastMemories.length > 0
@@ -460,6 +462,10 @@ async function runCycle(
   // ============================================================
   // 6a2. TriOrchestrator factory (LLM-based reasoning)
   // ============================================================
+  let streamCallback: ((chunk: string) => void) | undefined;
+  if (onProgress) {
+    streamCallback = onProgress;
+  }
   const runTriOrchestrator = async () => {
     const orchestrator = new TriOrchestrator({
       memoryDir: config.memoryDir,
@@ -471,6 +477,7 @@ async function runCycle(
         const response = await llm.chat(messages.map(m => ({ role: m.role as any, content: m.content })));
         return response;
       },
+      onStream: streamCallback,
     });
     return orchestrator.run(prompt, config.modules.triOrchestrator.maxIterations);
   };

@@ -20,7 +20,7 @@ export interface LarkConfig {
 }
 
 export interface LarkMessageHandler {
-  (text: string, sender: { chatId: string; senderId: string; messageId: string }): Promise<string>;
+  (text: string, sender: { chatId: string; senderId: string; messageId: string }, onProgress?: (chunk: string) => void): Promise<string>;
 }
 
 let channel: LarkChannel | null = null;
@@ -72,12 +72,50 @@ export async function startLarkBot(
     const textContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
 
     try {
+      // 1. Send acknowledgment immediately (like nanobot)
+      await channel!.send(
+        msg.chatId,
+        { text: "⏳ 收到，正在处理..." },
+        { replyTo: msg.messageId }
+      );
+
+      // 2. Collect streaming chunks for progress updates
+      let progressBuffer = "";
+      let progressTimer: ReturnType<typeof setTimeout> | null = null;
+      let lastSentLen = 0;
+
+      const onProgress = (chunk: string) => {
+        progressBuffer += chunk;
+        // Send progress update every 3 seconds
+        if (!progressTimer) {
+          progressTimer = setTimeout(async () => {
+            progressTimer = null;
+            if (progressBuffer.length > lastSentLen) {
+              const update = progressBuffer.slice(lastSentLen, lastSentLen + 200);
+              lastSentLen += update.length;
+              try {
+                await channel!.send(
+                  msg.chatId,
+                  { text: `📝 ${update}...` },
+                  { replyTo: msg.messageId }
+                );
+              } catch { /* ignore send errors during streaming */ }
+            }
+          }, 3000);
+        }
+      };
+
+      // 3. Run handler (may take 30-90s)
       const reply = await onMessage(textContent, {
         chatId: msg.chatId,
         senderId: msg.senderId,
         messageId: msg.messageId,
-      });
+      }, onProgress);
 
+      // Clear progress timer
+      if (progressTimer) clearTimeout(progressTimer);
+
+      // 4. Send final reply
       await channel!.send(
         msg.chatId,
         { text: reply.slice(0, 2000) }, // Lark text limit ~2000
