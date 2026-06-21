@@ -23,6 +23,8 @@ export interface LarkMessageHandler {
 }
 
 let channel: LarkChannel | null = null;
+const processedMessageIds = new Set<string>();
+const MESSAGE_DEDUP_WINDOW = 100; // Keep last 100 message IDs
 
 /**
  * Start Lark WebSocket connection and listen for messages.
@@ -42,6 +44,17 @@ export async function startLarkBot(
   });
 
   channel.on("message", async (msg: NormalizedMessage) => {
+    // Deduplicate: skip if we've already processed this message
+    if (processedMessageIds.has(msg.messageId)) {
+      console.log(`[Lark] Skipping duplicate message ${msg.messageId.slice(0, 16)}`);
+      return;
+    }
+    processedMessageIds.add(msg.messageId);
+    if (processedMessageIds.size > MESSAGE_DEDUP_WINDOW) {
+      const first = processedMessageIds.values().next().value;
+      if (first) processedMessageIds.delete(first);
+    }
+
     console.log(`[Lark] Message from ${msg.senderId}: ${msg.content.slice(0, 100)}`);
 
     try {
