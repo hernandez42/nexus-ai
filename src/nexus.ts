@@ -106,11 +106,12 @@ async function main() {
   // Lark Mode — 飞书机器人
   // ============================================================
   if (larkMode) {
-    const larkAppId = process.env.LARK_APP_ID || "";
-    const larkAppSecret = process.env.LARK_APP_SECRET || "";
+    // Support both LARK_* and FEISHU_* env prefixes for backward compatibility
+    const larkAppId = process.env.LARK_APP_ID || process.env.FEISHU_APP_ID || "";
+    const larkAppSecret = process.env.LARK_APP_SECRET || process.env.FEISHU_APP_SECRET || "";
 
     if (!larkAppId || !larkAppSecret) {
-      console.error("[Lark] LARK_APP_ID and LARK_APP_SECRET required. Set them in environment or nexus.env.");
+      console.error("[Lark] LARK_APP_ID (or FEISHU_APP_ID) and LARK_APP_SECRET (or FEISHU_APP_SECRET) required. Set them in environment or nexus.env.");
       process.exit(1);
     }
 
