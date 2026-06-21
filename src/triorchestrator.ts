@@ -195,15 +195,18 @@ If you have enough information to answer the user's question, set done: true and
         type: "THOUGHT",
         content: thoughtContent,
         timestamp: Date.now(),
+        signals: this.extractSignalsFromText(thoughtContent),
       });
 
       // 检查是否已经有最终答案
       if (thoughtParsed.done || thoughtParsed.final_answer) {
+        const finalContent = thoughtParsed.final_answer || thoughtContent;
         this.steps.push({
           step: stepNum,
           type: "FINAL",
-          content: thoughtParsed.final_answer || thoughtContent,
+          content: finalContent,
           timestamp: Date.now(),
+          signals: this.extractSignalsFromText(finalContent),
         });
         break;
       }
