@@ -150,9 +150,11 @@ export interface ReasoningConfig {
 export class AgentReasoningEngine {
   private config: ReasoningConfig;
   private steps: ReasonStep[] = [];
+  private onStream?: (chunk: string) => void;
 
-  constructor(config: ReasoningConfig) {
+  constructor(config: ReasoningConfig, onStream?: (chunk: string) => void) {
     this.config = config;
+    this.onStream = onStream;
   }
 
   /**
@@ -190,6 +192,11 @@ If you have enough information to answer the user's question, set done: true and
       const thoughtParsed = this.safeParseJSON(thoughtRaw, { thought: thoughtRaw, done: false, final_answer: "" });
       const thoughtContent = String(thoughtParsed.thought || thoughtRaw);
 
+      // Stream thought to caller (for progress updates)
+      if (this.onStream) {
+        this.onStream(thoughtContent.slice(0, 100));
+      }
+
       this.steps.push({
         step: stepNum,
         type: "THOUGHT",
@@ -226,6 +233,12 @@ Respond with JSON:
 
       const actionParsed = this.safeParseJSON(actionRaw, { tool: "", params: {}, reason: "" });
       const actionContent = `${actionParsed.tool} ${JSON.stringify(actionParsed.params)} (${actionParsed.reason})`;
+
+      // Stream action to caller
+      if (this.onStream) {
+        this.onStream(`[执行] ${actionParsed.tool}`);
+      }
+
       const toolName = actionParsed.tool;
       const params = actionParsed.params || {};
       const tool = this.config.tools.find(t => t.name === toolName);
@@ -729,6 +742,7 @@ export interface TriOrchestratorConfig {
   tools: AgentTool[];
   genes: Gene[];
   llmCall: (messages: Array<{role: string; content: string}>) => Promise<string>;
+  onStream?: (chunk: string) => void;
 }
 
 export interface TriOrchestratorResult {
@@ -742,15 +756,17 @@ export interface TriOrchestratorResult {
 
 export class TriOrchestrator {
   private config: TriOrchestratorConfig;
-  private learner: ExperienceLearner;
   private reasoner: AgentReasoningEngine;
   private explorer: CuriosityDrivenExplorer;
   private gep: GEPEngine;
+  private learner: ExperienceLearner;
   private selfAwareness: EternalAwakeningLoop | null = null;
   private currentSelfModel: SelfModel | null = null;
+  private onStream: (chunk: string) => void;
 
   constructor(config: TriOrchestratorConfig) {
     this.config = config;
+    this.onStream = config.onStream || (() => {});
     this.learner = new ExperienceLearner(config.memoryDir);
     // Build system prompt with tool descriptions — LLM decides what to use
     const toolDescriptions = config.tools.map(t =>
@@ -772,7 +788,7 @@ When you have enough information to answer, respond with:
       maxSteps: config.maxReasoningSteps,
       tools: config.tools,
       llmCall: config.llmCall,
-    });
+    }, config.onStream);
     this.explorer = new CuriosityDrivenExplorer(config.llmCall);
     this.gep = new GEPEngine(config.genes, config.llmCall, config.tools.map(t => t.name));
   }
@@ -819,7 +835,7 @@ When you have enough information to answer, respond with:
           maxSteps: this.config.maxReasoningSteps,
           tools: this.config.tools,
           llmCall: this.config.llmCall,
-        });
+        }, this.onStream);
         console.log(`  Injected self-awareness into system prompt (v${this.currentSelfModel.version})`);
       }
     }
