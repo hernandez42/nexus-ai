@@ -9,3 +9,11 @@ memory.json
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+
+# Evolver artifacts (假活产物)
+anticipate_engine.py
+cae_simulation.py
+cae_simulation_fixed.py
+context_anticipation_engine.py
+psre_architecture.json
+*.bak
