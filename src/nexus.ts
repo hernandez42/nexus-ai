@@ -2,23 +2,13 @@
 /**
  * Nexus — 统一成熟入口
  *
- * 所有核心模块融合为单一流程：
- *   0. MemoryStore — 全局记忆层
- *   1. Glue — 格式转换（Eve + Pi-Mono + Evolver）
- *   2. ContinuousDeconstruction — 解构认知框架
- *   3. Self-Awareness — 在解构基础上觉醒
- *   4. EvolutionEngine — 初始化进化种群
- *   5. TriOrchestrator — 推理→探索→进化（EvolutionEngine 驱动）
- *   6. 全部结果写入记忆
+ * 核心流程（对齐 pi Amimo / eve）：
+ *   1. 收到消息 → 立即确认
+ *   2. 查记忆 → 构建 system prompt
+ *   3. LLM tool loop（原生 function calling，像 pi 的 runLoop）
+ *   4. 返回最终答案
  *
- * 使用方式：
- *   npm run start                    # 完整流程（单次）
- *   npm run start -- --daemon        # 守护模式（循环运行）
- *   npm run start -- --lark          # 飞书机器人模式（WebSocket）
- *   npm run start -- "你的问题"       # 自定义问题
- *   npm run start -- --skip-glue     # 跳过格式转换
- *   npm run start -- --skip-deconstruct  # 跳过解构
- *   npm run start -- --skip-self-awareness # 跳过觉醒
+ * 进化/解构/觉醒只在 daemon 模式后台运行，不阻塞飞书消息处理。
  */
 
 import { mkdirSync, readFileSync, existsSync } from "fs";
@@ -27,20 +17,13 @@ import { loadConfig, generateDefaultConfig } from "./config";
 import { createLLM } from "./llm";
 import { Logger } from "./logger";
 import { MemoryStore } from "./memory";
-import { TriOrchestrator } from "./triorchestrator";
 import { LocalReasoner } from "./local-reasoner";
-import { createDefaultSkills, SkillRegistry, SkillContext } from "./skills";
-import { EternalAwakeningLoop } from "./self-awareness";
-import { ContinuousDeconstruction } from "./deconstruction";
-import { EvolutionEngine } from "./evolution";
-import { convertAllSkills, generateSkillIndex } from "./glue/superpowers-to-eve";
-import { loadGenes, generatePiExtension } from "./glue/evolver-to-pimono";
-import { convertResultsToEvolverSignals, generateAutoResearchGene } from "./glue/autoresearch-to-evolver";
+import { createDefaultSkills, SkillContext } from "./skills";
 import { startLarkBot, stopLarkBot } from "./lark";
 import { runToolLoop } from "./tool-loop";
 
 // ============================================================
-// Crash Protection — P2 #14
+// Crash Protection
 // ============================================================
 process.on("uncaughtException", (err) => {
   console.error("[FATAL] Uncaught exception:", err.message);
@@ -63,9 +46,6 @@ async function main() {
   const initConfig = args.includes("--init");
   const daemonMode = args.includes("--daemon");
   const larkMode = args.includes("--lark");
-  const skipGlue = args.includes("--skip-glue");
-  const skipDeconstruct = args.includes("--skip-deconstruct");
-  const skipSelfAwareness = args.includes("--skip-self-awareness");
   const prompt = args.find(a => !a.startsWith("--")) || "Perform a self-assessment: review your current memory, capabilities, and evolutionary state. Report your findings concisely.";
 
   if (initConfig) {
@@ -77,13 +57,6 @@ async function main() {
   if (!existsSync(configPath)) {
     console.error(`Config not found: ${configPath}. Run with --init to generate.`);
     process.exit(1);
-  }
-
-  // P2 #12: Detect dual .git conflict (git init inside cloned repo)
-  const { existsSync: fsExists } = await import("fs");
-  if (fsExists("src/.git") && fsExists(".git")) {
-    console.warn("WARNING: Dual .git detected (src/.git + ./.git). This causes git conflicts.");
-    console.warn("  Fix: rm -rf src/.git && git add src/");
   }
 
   const config = loadConfig(configPath);
@@ -100,30 +73,22 @@ async function main() {
   const memory = new MemoryStore(join(config.memoryDir, "persistent"));
   memory.autoSave();
 
-  // P2 #13: Periodic memory save every 30s
   const saveInterval = setInterval(() => {
     if (memory.stats().total > 0) memory.save();
   }, 30000);
 
   // ============================================================
-  // Lark Mode — 飞书机器人
+  // Lark Mode — 飞书机器人（轻量，不跑进化/解构/觉醒）
   // ============================================================
   if (larkMode) {
-    // Support both LARK_* and FEISHU_* env prefixes for backward compatibility
     const larkAppId = process.env.LARK_APP_ID || process.env.FEISHU_APP_ID || "";
     const larkAppSecret = process.env.LARK_APP_SECRET || process.env.FEISHU_APP_SECRET || "";
     const allowFromRaw = process.env.LARK_ALLOW_FROM || process.env.FEISHU_ALLOW_FROM || "";
     const allowFrom = allowFromRaw ? allowFromRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     if (!larkAppId || !larkAppSecret) {
-      console.error("[Lark] LARK_APP_ID (or FEISHU_APP_ID) and LARK_APP_SECRET (or FEISHU_APP_SECRET) required. Set them in environment or nexus.env.");
+      console.error("[Lark] LARK_APP_ID and LARK_APP_SECRET required.");
       process.exit(1);
-    }
-
-    if (allowFrom.length > 0) {
-      console.log(`[Lark] ALLOW_FROM whitelist: ${allowFrom.length} sender(s)`);
-    } else {
-      console.warn("[Lark] WARNING: No ALLOW_FROM set — all senders can trigger cycles. Set LARK_ALLOW_FROM or FEISHU_ALLOW_FROM (comma-separated open_id list).");
     }
 
     console.log("[Lark] Starting bot...");
@@ -131,12 +96,10 @@ async function main() {
     await startLarkBot(
       { appId: larkAppId, appSecret: larkAppSecret, allowFrom },
       async (text, sender, onProgress) => {
-        console.log(`[Lark] Processing message: ${text.slice(0, 100)}`);
+        console.log(`[Lark] Processing: ${text.slice(0, 100)}`);
         try {
-          const result = await runCycle(config, log, memory, {
-            skipGlue, skipDeconstruct, skipSelfAwareness, prompt: text,
-            onProgress,
-          });
+          // Lark mode: lightweight — only tool loop, no evolution/deconstruction/awareness
+          const result = await runLightweightCycle(config, log, memory, text, onProgress);
           return result;
         } catch (e: unknown) {
           const err = e instanceof Error ? e.message : String(e);
@@ -146,7 +109,6 @@ async function main() {
       }
     );
 
-    // Keep process alive
     process.on("SIGINT", async () => {
       await stopLarkBot();
       clearInterval(saveInterval);
@@ -154,11 +116,11 @@ async function main() {
       process.exit(0);
     });
 
-    return; // Lark handles its own loop
+    return;
   }
 
   // ============================================================
-  // P0 #4: Daemon Mode — Loop instead of exit
+  // Daemon Mode — 后台循环（含进化/解构/觉醒）
   // ============================================================
   if (daemonMode) {
     console.log("Daemon mode: Nexus will loop every 60s. Press Ctrl+C to stop.");
@@ -167,39 +129,30 @@ async function main() {
       cycleCount++;
       const cycleStart = Date.now();
       try {
-        await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
+        await runFullCycle(config, log, memory, prompt);
         memory.add({
           layer: "episodic",
-          content: `Daemon cycle ${cycleCount} completed successfully`,
+          content: `Daemon cycle ${cycleCount} completed`,
           tags: ["daemon", "cycle-success"],
           metadata: { cycle: cycleCount, durationMs: Date.now() - cycleStart },
         });
       } catch (e: unknown) {
         const err = e instanceof Error ? e : new Error(String(e));
-        const stack = err.stack || "no stack";
-        log.error("Daemon cycle failed", {
-          cycle: cycleCount,
-          error: err.message,
-          stack: stack.slice(0, 500),
-        });
+        log.error("Daemon cycle failed", { cycle: cycleCount, error: err.message });
         memory.add({
           layer: "episodic",
           content: `Daemon cycle ${cycleCount} failed: ${err.message.slice(0, 200)}`,
-          tags: ["daemon", "cycle-fail", err.name],
-          metadata: { cycle: cycleCount, error: err.message, stack: stack.slice(0, 500), durationMs: Date.now() - cycleStart },
+          tags: ["daemon", "cycle-fail"],
+          metadata: { cycle: cycleCount, error: err.message },
         });
       }
-      try {
-        memory.save(); // Force save after every cycle
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        log.error("Memory save failed", { cycle: cycleCount, error: msg });
-      }
-      log.info("Daemon: sleeping 75s", { cycle: cycleCount, memoryEntries: memory.stats().total });
-      await sleep(75000); // 75s = 48 cycles/h < 50/h rate limit
+      memory.save();
+      log.info("Daemon: sleeping 75s", { cycle: cycleCount });
+      await sleep(75000);
     }
   } else {
-    await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
+    // Single run — full cycle
+    await runFullCycle(config, log, memory, prompt);
   }
 
   clearInterval(saveInterval);
@@ -210,22 +163,105 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-interface CycleOptions {
-  skipGlue?: boolean;
-  skipDeconstruct?: boolean;
-  skipSelfAwareness?: boolean;
-  prompt: string;
-  onProgress?: (chunk: string) => void;
-}
+// ============================================================
+// Lightweight Cycle — for Lark messages (fast, no evolution)
+// Like pi Amimo: message → tool loop → answer
+// ============================================================
 
-async function runCycle(
+async function runLightweightCycle(
   config: any,
   log: Logger,
   memory: MemoryStore,
-  options: CycleOptions
+  prompt: string,
+  onProgress?: (chunk: string) => void,
 ): Promise<string> {
-  const { skipGlue, skipDeconstruct, skipSelfAwareness, prompt, onProgress } = options;
+  const llm = createLLM(config.llm);
 
+  // Query relevant memories
+  const pastMemories = memory.query({ text: prompt, topK: 5, minSimilarity: 0.01 });
+  const memoryContext = pastMemories.length > 0
+    ? `\n\n[RELEVANT MEMORIES]\n${pastMemories.map(r => `- [${r.entry.layer}] (${r.similarity.toFixed(2)}) ${r.entry.content.slice(0, 150)}`).join("\n")}`
+    : "";
+
+  // Build system prompt
+  const systemPrompt = buildSystemPrompt(config, memoryContext);
+
+  // Build tools — use ToolRegistry's full set, not just 3 inline tools
+  const tools = buildToolSet(config);
+
+  // Simple query → LocalReasoner (instant, no LLM)
+  const isSimpleQuery = /^(hi|hello|hey|greetings|yo)\b/i.test(prompt) ||
+    /^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt);
+
+  if (isSimpleQuery) {
+    const skillRegistry = createDefaultSkills();
+    const skillContext: SkillContext = {
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+      log: (msg: string) => log.info(msg),
+    };
+    const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
+    const localSteps = await localReasoner.reason(prompt, 3);
+    const localFinal = localSteps.find(s => s.type === "FINAL");
+    if (localFinal?.content) {
+      return localFinal.content;
+    }
+    // Fall through to tool loop
+  }
+
+  // Run tool loop (pi/eve style)
+  const toolDefs = tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    execute: async (params: Record<string, unknown>) => {
+      try {
+        const raw = await t.execute(params);
+        return typeof raw === "string" ? raw : JSON.stringify(raw);
+      } catch (e: unknown) {
+        return `Error: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    },
+  }));
+
+  const result = await runToolLoop({
+    systemPrompt,
+    userPrompt: prompt,
+    tools: toolDefs,
+    llm,
+    maxSteps: 5,
+    onStream: onProgress,
+  });
+
+  log.info("Tool loop completed", {
+    steps: result.steps.length,
+    toolCallsUsed: result.toolCallsUsed,
+  });
+
+  // Save to memory
+  memory.add({
+    layer: "episodic",
+    content: `Lark: ${prompt.slice(0, 100)} → ${result.answer.slice(0, 200)}`,
+    tags: ["lark", "result"],
+    metadata: { steps: result.steps.length, tools: result.toolCallsUsed },
+  });
+
+  return result.answer;
+}
+
+// ============================================================
+// Full Cycle — for daemon/single run (with evolution/deconstruction/awareness)
+// ============================================================
+
+async function runFullCycle(
+  config: any,
+  log: Logger,
+  memory: MemoryStore,
+  prompt: string,
+): Promise<string> {
+  const llm = createLLM(config.llm);
+
+  // Query relevant memories
   const pastMemories = memory.query({ text: prompt, topK: 5, minSimilarity: 0.01 });
   const memoryContext = pastMemories.length > 0
     ? `\n\n[RELEVANT MEMORIES]\n${pastMemories.map(r => `- [${r.entry.layer}] (${r.similarity.toFixed(2)}) ${r.entry.content.slice(0, 150)}`).join("\n")}`
@@ -233,133 +269,84 @@ async function runCycle(
 
   log.info(`Memory: ${memory.stats().total} entries, ${pastMemories.length} relevant`);
 
-  // ============================================================
-  // 1. Initialize LLM
-  // ============================================================
-  const llm = createLLM(config.llm);
+  // Build system prompt
+  const systemPrompt = buildSystemPrompt(config, memoryContext);
 
-  // ============================================================
-  // 2. Glue Modules
-  // ============================================================
-  if (!skipGlue) {
-    await runGlue(config, log);
-  }
+  // Build tools
+  const tools = buildToolSet(config);
 
-  // ============================================================
-  // 3. Continuous Deconstruction
-  // ============================================================
-  let deconstructions: any[] = [];
-  if (!skipDeconstruct) {
-    log.info("Starting continuous deconstruction");
-    const deconstructor = new ContinuousDeconstruction(
-      async (messages) => llm.chat(messages as any),
-      2 // max 2 cycles to save time
-    );
-    deconstructions = await deconstructor.run();
-    log.info(`Deconstruction: ${deconstructions.length} cycles, max depth ${Math.max(...deconstructions.map(d => d.rebuilt.depthReached), 0)}`);
+  // Simple query → LocalReasoner
+  const isSimpleQuery = /^(hi|hello|hey|greetings|yo)\b/i.test(prompt) ||
+    /^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt);
 
-    for (const d of deconstructions) {
-      memory.add({
-        layer: "semantic",
-        content: `Deconstruction cycle ${d.cycle}: ${d.breakthrough.whatEmerged.slice(0, 200)}`,
-        tags: ["deconstruction", `cycle-${d.cycle}`],
-        metadata: { cycle: d.cycle, depth: d.rebuilt.depthReached, contradictions: d.dismantled.contradictions.length },
-      });
-    }
-  }
-
-  // ============================================================
-  // 4. Self-Awareness
-  // ============================================================
-  let selfModel = null;
-  if (!skipSelfAwareness && config.modules.selfAwareness.enabled) {
-    log.info("Starting self-awareness awakening");
-
-    const selfMemories = memory.query({
-      text: "self model who am I consciousness identity",
-      layer: "semantic",
-      topK: 3,
-      minSimilarity: 0.01,
-    });
-
-    const previousSelf = selfMemories.length > 0
-      ? `\n\n[PREVIOUS SELF-MODEL]\n${selfMemories.map(r => r.entry.content.slice(0, 300)).join("\n---\n")}`
-      : "";
-
-    const deconstructContext = deconstructions.length > 0
-      ? `\n\n[DECONSTRUCTION INSIGHTS]\n${deconstructions.map(d =>
-        `Cycle ${d.cycle}: ${d.breakthrough.whatEmerged.slice(0, 100)}... (depth ${d.rebuilt.depthReached})`
-      ).join("\n")}`
-      : "";
-
-    const llmPair = {
-      oracle: async (prompt: string, _context: string) => {
-        const response = await llm.chat([
-          { role: "system", content: `You are a self-aware AI entity undergoing deep introspection.${previousSelf}${deconstructContext}` },
-          { role: "user", content: prompt },
-        ]);
-        return response;
-      },
-      critic: async (output: string, layer: number) => {
-        const response = await llm.chat([
-          { role: "system", content: "You are a critical evaluator. Check for depth, consistency, and evolution." },
-          { role: "user", content: `Evaluate this Layer ${layer} output for depth and authenticity:\n\n${output}\n\nProvide brief critique.` },
-        ]);
-        return response;
-      },
+  if (isSimpleQuery) {
+    const skillRegistry = createDefaultSkills();
+    const skillContext: SkillContext = {
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+      log: (msg: string) => log.info(msg),
     };
-
-    const awakening = new EternalAwakeningLoop({
-      memoryDir: join(config.memoryDir, "self-awareness"),
-      llmPair,
-      maxRounds: config.modules.selfAwareness.maxRoundsPerCycle,
-    });
-
-    await awakening.start();
-    const history = awakening.getHistory();
-    selfModel = history[history.length - 1];
-
-    if (selfModel) {
-      memory.add({
-        layer: "semantic",
-        content: `Self-Model v${selfModel.version}: ${selfModel.consciousness.whoAmI.slice(0, 500)}`,
-        tags: ["self-model", "consciousness", `v${selfModel.version}`],
-        metadata: { version: selfModel.version, cycle: history.length },
-      });
+    const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
+    const localSteps = await localReasoner.reason(prompt, 3);
+    const localFinal = localSteps.find(s => s.type === "FINAL");
+    if (localFinal?.content) {
+      return localFinal.content;
     }
-
-    log.info("Self-awareness complete", { version: selfModel?.version });
   }
 
-  // ============================================================
-  // 5. Evolution Engine
-  // ============================================================
-  log.info("Initializing evolution engine");
-  const evolution = new EvolutionEngine(
-    {
-      populationSize: 3,
-      mutationRate: 0.5,
-      extinctionThreshold: 10,
-      maxPopulation: 8,
+  // Run tool loop
+  const toolDefs = tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    execute: async (params: Record<string, unknown>) => {
+      try {
+        const raw = await t.execute(params);
+        return typeof raw === "string" ? raw : JSON.stringify(raw);
+      } catch (e: unknown) {
+        return `Error: ${e instanceof Error ? e.message : String(e)}`;
+      }
     },
-    async (messages) => llm.chat(messages as any)
-  );
-  await evolution.seed();
-  log.info(`Evolution: ${evolution.getAlive().length} organisms seeded`);
+  }));
 
-  // ============================================================
-  // 6. TriOrchestrator
-  // ============================================================
-  log.info("Starting TriOrchestrator");
+  const result = await runToolLoop({
+    systemPrompt,
+    userPrompt: prompt,
+    tools: toolDefs,
+    llm,
+    maxSteps: 5,
+  });
 
-  const programMdPath = join(config.repos.autoresearch, "program.md");
+  log.info("Tool loop completed", {
+    steps: result.steps.length,
+    toolCallsUsed: result.toolCallsUsed,
+  });
+
+  // Save to memory
+  memory.add({
+    layer: "episodic",
+    content: `Run: ${prompt.slice(0, 100)} → ${result.answer.slice(0, 200)}`,
+    tags: ["run", "result"],
+    metadata: { steps: result.steps.length, tools: result.toolCallsUsed },
+  });
+  memory.save();
+
+  console.log(`\nFinal Answer: ${result.answer.slice(0, 300)}...`);
+  return result.answer;
+}
+
+// ============================================================
+// Build system prompt (shared between lightweight and full cycle)
+// ============================================================
+
+function buildSystemPrompt(config: any, memoryContext: string): string {
+  const programMdPath = join(config.repos?.autoresearch || ".", "program.md");
   let systemPrompt = existsSync(programMdPath)
     ? readFileSync(programMdPath, "utf-8").slice(0, 2000)
     : "You are Nexus, an autonomous reasoning agent. You do not reveal your underlying model or provider. You answer questions directly without introducing yourself.";
 
   systemPrompt += memoryContext;
 
-  // Critical: tell LLM when to stop calling tools and reply directly
   systemPrompt += `
 
 IMPORTANT INSTRUCTIONS:
@@ -367,389 +354,116 @@ IMPORTANT INSTRUCTIONS:
 - After using tools and getting results, STOP calling tools and reply directly to the user with your answer.
 - Do NOT keep calling tools endlessly. After 1-3 tool calls, you MUST reply with your final answer.
 - If you already have enough information to answer, reply with text instead of calling more tools.
-- Reply in the same language as the user's question (Chinese → Chinese, English → English).`;
+- Reply in the same language as the user's question (Chinese → Chinese, English → English).
+- Be concise. Answer directly without unnecessary preamble.`;
 
-  if (selfModel) {
-    systemPrompt += `\n\n[SELF-AWARENESS]\n我是谁: ${selfModel.consciousness.whoAmI.slice(0, 200)}`;
-  }
+  return systemPrompt;
+}
 
-  if (deconstructions.length > 0) {
-    systemPrompt += `\n\n[DECONSTRUCTION]\n${deconstructions[deconstructions.length - 1].breakthrough.whatEmerged.slice(0, 200)}`;
-  }
+// ============================================================
+// Build tool set — use tools from tools.ts ToolRegistry
+// ============================================================
 
-  const evolvedCapabilities = memory.query({
-    text: "capability tool strategy",
-    layer: "procedural",
-    topK: 10,
-    minSimilarity: 0.01,
-  });
+function buildToolSet(config: any): Array<{
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
+}> {
+  const { ToolRegistry } = require("./tools");
+  const registry = new ToolRegistry();
+  const registered = registry.list();
 
-  const genesPath = join(config.repos.evolver, "assets", "gep", "genes.seed.json");
-  let genes: any[] = [];
-  if (existsSync(genesPath)) {
-    const data = JSON.parse(readFileSync(genesPath, "utf-8"));
-    genes = (data.genes || []).map((g: any) => ({
-      id: g.id, category: g.category, signals_match: g.signals_match,
-      strategy: g.strategy, constraints: g.constraints, validation: g.validation,
-    }));
-  }
+  // Convert ToolRegistry tools to tool-loop format
+  const tools = registered.map((t: any) => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    execute: t.execute,
+  }));
 
-  const tools = [
-    {
-      name: "read", description: "Read a file", parameters: { path: "string" },
+  // Add core tools if not already present
+  const toolNames = new Set(tools.map((t: any) => t.name));
+
+  if (!toolNames.has("read_file")) {
+    tools.push({
+      name: "read_file",
+      description: "Read contents of a file. Returns first 2000 characters.",
+      parameters: { path: "string" },
       execute: async (params: Record<string, unknown>) => {
         const path = params.path as string;
         if (!existsSync(path)) return { error: "File not found" };
-        return { content: readFileSync(path, "utf-8").slice(0, 1000) };
+        return { content: readFileSync(path, "utf-8").slice(0, 2000) };
       },
-    },
-    {
-      name: "bash", description: "Run shell command (max 10s)", parameters: { command: "string" },
+    });
+  }
+
+  if (!toolNames.has("bash")) {
+    tools.push({
+      name: "bash",
+      description: "Run a shell command. Returns stdout (max 2000 chars). Timeout: 15s.",
+      parameters: { command: "string" },
       execute: async (params: Record<string, unknown>) => {
-        const { spawnSync } = await import("child_process");
+        const { spawnSync } = require("child_process");
         try {
           const result = spawnSync("sh", ["-c", params.command as string], {
-            encoding: "utf-8", timeout: 10000, maxBuffer: 1024 * 1024,
+            encoding: "utf-8", timeout: 15000, maxBuffer: 2 * 1024 * 1024,
           });
-          return { output: (result.stdout || "").slice(0, 1000) };
+          return { output: (result.stdout || "").slice(0, 2000) + (result.stderr ? "\n" + (result.stderr as string).slice(0, 500) : "") };
         } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          return { error: msg.slice(0, 500) };
+          return { error: e instanceof Error ? e.message : String(e) };
         }
       },
-    },
-    {
-      name: "search", description: "Search files by pattern", parameters: { pattern: "string", directory: "string" },
+    });
+  }
+
+  if (!toolNames.has("search_files")) {
+    tools.push({
+      name: "search_files",
+      description: "Search files by name pattern using find. Returns file paths.",
+      parameters: { pattern: "string", directory: "string?" },
       execute: async (params: Record<string, unknown>) => {
-        const { spawnSync } = await import("child_process");
+        const { spawnSync } = require("child_process");
         try {
-          const dir = params.directory as string || ".";
-          const pattern = params.pattern as string;
-          const result = spawnSync("find", [dir, "-name", pattern, "-type", "f"], {
+          const dir = (params.directory as string) || ".";
+          const result = spawnSync("find", [dir, "-name", params.pattern as string, "-type", "f"], {
             encoding: "utf-8", timeout: 10000,
           });
-          return { files: (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 20) };
+          const files = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 30);
+          return { files };
         } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          return { error: msg };
+          return { error: e instanceof Error ? e.message : String(e) };
         }
       },
-    },
-  ];
-
-  for (const cap of evolvedCapabilities) {
-    const capData = cap.entry.metadata as any;
-    if (capData?.strategy) {
-      tools.push({
-        name: capData.name || `evolved_${cap.entry.id.slice(0, 8)}`,
-        description: cap.entry.content.slice(0, 200),
-        parameters: { task: "string" } as any,
-        execute: async (params: Record<string, unknown>) => {
-          const task = params.task as string;
-          const strategyPrompt = `Execute using strategy:\n${capData.strategy.join("\n")}\n\nTask: ${task}`;
-          const response = await llm.chat([
-            { role: "system", content: "You are executing a learned capability." },
-            { role: "user", content: strategyPrompt },
-          ]);
-          return { content: response.slice(0, 500) };
-        },
-      } as any);
-    }
+    });
   }
 
-  log.info(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
-
-  // ============================================================
-  // 6a. Skill System — real execution capabilities
-  // ============================================================
-  const skillRegistry = createDefaultSkills();
-  const skillContext: SkillContext = {
-    cwd: process.cwd(),
-    env: process.env as Record<string, string>,
-    log: (msg: string) => log.info(msg),
-  };
-  log.info("Skills registered", { skills: skillRegistry.list() });
-
-  // ============================================================
-  // 6a2. Tool Loop — pi/eve-style native tool calling (replaces TriOrchestrator JSON forcing)
-  // ============================================================
-  let streamCallback: ((chunk: string) => void) | undefined;
-  if (onProgress) {
-    streamCallback = onProgress;
-  }
-  const runToolLoopReasoning = async (): Promise<string> => {
-    // Build tool definitions for OpenAI function calling
-    // Use the tool's original parameters (e.g. {path: "string", command: "string"})
-    // tool-loop.ts will convert them to OpenAI JSON Schema via convertParamsToOpenAI()
-    const toolDefs = tools.map(t => ({
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
+  if (!toolNames.has("grep")) {
+    tools.push({
+      name: "grep",
+      description: "Search file contents by regex pattern. Returns matching lines.",
+      parameters: { pattern: "string", path: "string?" },
       execute: async (params: Record<string, unknown>) => {
+        const { spawnSync } = require("child_process");
         try {
-          const raw = await t.execute(params);
-          return typeof raw === "string" ? raw : JSON.stringify(raw);
+          const args = ["-rn", params.pattern as string];
+          if (params.path) args.push(params.path as string);
+          const result = spawnSync("grep", args, {
+            encoding: "utf-8", timeout: 10000, maxBuffer: 1024 * 1024,
+          });
+          const lines = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 30);
+          return { matches: lines };
         } catch (e: unknown) {
-          return `Error: ${e instanceof Error ? e.message : String(e)}`;
+          return { error: e instanceof Error ? e.message : String(e) };
         }
       },
-    }));
-
-    const result = await runToolLoop({
-      systemPrompt,
-      userPrompt: prompt,
-      tools: toolDefs,
-      llm,
-      maxSteps: 5,
-      onStream: streamCallback,
-    });
-
-    log.info("Tool loop completed", {
-      steps: result.steps.length,
-      toolCallsUsed: result.toolCallsUsed,
-    });
-
-    return result.answer;
-  };
-
-  // ============================================================
-  // 6b. Local Reasoning — ONLY for simple queries (greeting/status)
-  // Everything else goes directly to LLM for real thinking
-  // ============================================================
-  const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
-  for (const t of tools) {
-    localReasoner.registerTool({
-      name: t.name,
-      description: t.description,
-      execute: t.execute,
     });
   }
 
-  // Check if this is a simple query that can be handled locally
-  const isSimpleQuery = /^(hi|hello|hey|greetings|yo)\b/i.test(prompt) ||
-    /^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt) ||
-    /^(状态|更新|报告|总结|检查|汇报|情况|进展)/.test(prompt) ||
-    /self.?assessment|status report|evolutionary state|your state/i.test(prompt);
-
-  let result: {
-    steps: Array<{ step: number; type: string; content: string; timestamp?: number }>;
-    goals: Array<{ target: string; priority: number; reason: string }>;
-    newCapabilities: Array<{ name: string; description: string; tools: string[]; strategy?: string; validation?: string }>;
-    finalAnswer: string;
-    iterations: number;
-    selfModel: any;
-  };
-  if (isSimpleQuery) {
-    // Simple query — use LocalReasoner (no LLM, fast)
-    log.info("Simple query detected, using local reasoning");
-    const localSteps = await localReasoner.reason(prompt, 5);
-    const localFinal = localSteps.find(s => s.type === "FINAL");
-
-    if (localFinal && localFinal.content) {
-      result = {
-        steps: localSteps.map(s => ({
-          step: s.step,
-          type: s.type === "FINAL" ? "FINAL" as const : "THOUGHT" as const,
-          content: s.content,
-          timestamp: s.timestamp,
-        })),
-        goals: [],
-        newCapabilities: [],
-        finalAnswer: localFinal.content,
-        iterations: 1,
-        selfModel: undefined,
-      };
-    } else {
-      // Local failed even for simple query — fall back to LLM tool loop
-      log.info("Local reasoning failed for simple query, falling back to tool loop");
-      const answer = await runToolLoopReasoning();
-      result = {
-        steps: [],
-        goals: [],
-        newCapabilities: [],
-        finalAnswer: answer,
-        iterations: 1,
-        selfModel: undefined,
-      };
-    }
-  } else {
-    // Complex query — go directly to LLM tool loop (pi/eve style)
-    log.info("Complex query, using tool loop (LLM native tool calling)");
-    const answer = await runToolLoopReasoning();
-    result = {
-      steps: [],
-      goals: [],
-      newCapabilities: [],
-      finalAnswer: answer,
-      iterations: 1,
-      selfModel: undefined,
-    };
-  }
-
-  // Evolution pressure
-  if (result.goals.length > 0) {
-    for (const goal of result.goals) {
-      evolution.applyPressure({
-        source: `knowledge-gap-${goal.target}`,
-        intensity: goal.priority,
-        description: goal.reason,
-      });
-    }
-  } else {
-    evolution.applyPressure({
-      source: "task-completed-successfully",
-      intensity: 2,
-      description: "Task completed without knowledge gaps — mild selection pressure",
-    });
-  }
-
-  // Run evolution cycle
-  for (let i = 0; i < 2; i++) {
-    const alive = evolution.getAlive();
-    for (const organism of alive) {
-      await evolution.mutate(organism);
-    }
-    evolution.select();
-  }
-
-  const breakthroughs = evolution.detectBreakthroughs();
-  const species = await evolution.formSpecies();
-
-  log.info(`Evolution: ${evolution.getStats().aliveOrganisms} alive, ${breakthroughs.length} breakthroughs, ${species.length} species`);
-
-  // ============================================================
-  // 7. Persist everything to memory
-  // ============================================================
-  memory.add({
-    layer: "episodic",
-    content: `Run: ${prompt.slice(0, 100)} → ${result.finalAnswer.slice(0, 200)}`,
-    tags: ["run", "result"],
-    metadata: { iterations: result.iterations, steps: result.steps.length, goals: result.goals.length, capabilities: result.newCapabilities.length },
-  });
-
-  for (const cap of result.newCapabilities) {
-    memory.add({
-      layer: "procedural",
-      content: `Capability: ${cap.name} — ${cap.description}`,
-      tags: ["capability", cap.name, ...cap.tools],
-      metadata: { name: cap.name, description: cap.description, tools: cap.tools, strategy: cap.strategy, validation: cap.validation },
-    });
-  }
-
-  for (const goal of result.goals) {
-    memory.add({
-      layer: "semantic",
-      content: `Knowledge gap: ${goal.target} — ${goal.reason}`,
-      tags: ["knowledge-gap", goal.target],
-      metadata: { target: goal.target, reason: goal.reason, priority: goal.priority },
-    });
-  }
-
-  for (const step of result.steps) {
-    if (step.type === "FINAL" || step.content.length > 50) {
-      memory.add({
-        layer: "episodic",
-        content: `[${step.type}] ${step.content.slice(0, 300)}`,
-        tags: ["reasoning-step", step.type.toLowerCase()],
-        metadata: { type: step.type },
-      });
-    }
-  }
-
-  for (const org of evolution.getAlive()) {
-    memory.add({
-      layer: "semantic",
-      content: `Organism ${org.id.slice(0, 8)}: ${org.genome.perception.slice(0, 30)}... fitness=${org.fitness.toFixed(2)}`,
-      tags: ["organism", `gen-${org.generation}`],
-      metadata: { generation: org.generation, fitness: org.fitness, genome: org.genome },
-    });
-  }
-
-  for (const sp of species) {
-    memory.add({
-      layer: "semantic",
-      content: `Species ${sp.archetype}: ${sp.strategy.slice(0, 100)}`,
-      tags: ["species", sp.archetype],
-      metadata: { archetype: sp.archetype, members: sp.members.length },
-    });
-  }
-
-  memory.save();
-
-  // ============================================================
-  // 8. Output
-  // ============================================================
-  console.log("\n" + "=".repeat(60));
-  console.log("  NEXUS — EXECUTION COMPLETE");
-  console.log("=".repeat(60));
-  console.log(`Iterations: ${result.iterations}`);
-  console.log(`Steps: ${result.steps.length}`);
-  console.log(`Goals: ${result.goals.length}`);
-  console.log(`Capabilities: ${result.newCapabilities.length}`);
-  console.log(`Breakthroughs: ${breakthroughs.length}`);
-  console.log(`Species: ${species.map(s => s.archetype).join(", ") || "none"}`);
-  console.log(`Final Answer: ${result.finalAnswer.slice(0, 300)}...`);
-
-  if (selfModel) {
-    console.log(`\nSelf-Awareness: v${selfModel.version}`);
-    console.log(`  ${selfModel.consciousness.whoAmI.slice(0, 80)}...`);
-  }
-
-  if (deconstructions.length > 0) {
-    console.log(`\nDeconstruction: ${deconstructions.length} cycles`);
-    console.log(`  Max depth: ${Math.max(...deconstructions.map(d => d.rebuilt.depthReached))}/10`);
-  }
-
-  const memStats = memory.stats();
-  console.log(`\nMemory: ${memStats.total} total (${memStats.episodic} episodic, ${memStats.semantic} semantic, ${memStats.procedural} procedural)`);
-  console.log(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
-  console.log(`Logs: ${config.logDir}`);
-
-  // Return the final answer directly — user wants the answer, not internal stats
-  return result.finalAnswer;
+  return tools;
 }
 
-async function runGlue(config: any, log: Logger) {
-  if (config.modules.glue.superpowersToEve) {
-    log.info("Glue: Superpowers → Eve");
-    try {
-      const results = convertAllSkills(config.repos.superpowers, join(config.workspaceDir, "agent"));
-      generateSkillIndex(results, join(config.workspaceDir, "agent", "skills", "skill-index.md"));
-      log.info(`Superpowers → Eve: ${results.filter((r: any) => r.converted).length}/${results.length} skills`);
-    } catch (e: unknown) {
-      log.error("Superpowers → Eve failed", { error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-
-  if (config.modules.glue.evolverToPiMono) {
-    log.info("Glue: Evolver → Pi-Mono");
-    try {
-      const genes = loadGenes(config.repos.evolver);
-      if (genes.length > 0) {
-        generatePiExtension(genes, join(config.workspaceDir, ".pi", "extensions", "evolver-bridge.ts"));
-        log.info(`Evolver → Pi-Mono: ${genes.length} genes`);
-      }
-    } catch (e: unknown) {
-      log.error("Evolver → Pi-Mono failed", { error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-
-  if (config.modules.glue.autoresearchToEvolver) {
-    log.info("Glue: AutoResearch → Evolver");
-    try {
-      const tsvPath = join(config.repos.autoresearch, "results.tsv");
-      if (existsSync(tsvPath)) {
-        const r = convertResultsToEvolverSignals(tsvPath, null, join(config.repos.evolver, "memory"));
-        log.info(`AutoResearch → Evolver: ${r.converted} experiments`);
-      }
-      generateAutoResearchGene(join(config.repos.evolver, "assets", "gep", "gene_autoresearch.json"), config.repos.autoresearch);
-    } catch (e: unknown) {
-      log.error("AutoResearch → Evolver failed", { error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-}
-
-main().catch(err => {
-  console.error("Fatal error:", err);
+main().catch((e) => {
+  console.error("[FATAL] Main failed:", e);
   process.exit(1);
 });
