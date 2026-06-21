@@ -13,6 +13,7 @@
 
 import { mkdirSync, readFileSync, existsSync } from "fs";
 import { join } from "path";
+import { spawnSync } from "child_process";
 import { loadConfig, generateDefaultConfig } from "./config";
 import { createLLM } from "./llm";
 import { Logger } from "./logger";
@@ -21,6 +22,7 @@ import { LocalReasoner } from "./local-reasoner";
 import { createDefaultSkills, SkillContext } from "./skills";
 import { startLarkBot, stopLarkBot } from "./lark";
 import { runToolLoop } from "./tool-loop";
+import { ToolRegistry } from "./tools";
 
 // ============================================================
 // Crash Protection
@@ -370,7 +372,6 @@ function buildToolSet(config: any): Array<{
   parameters: Record<string, unknown>;
   execute: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 }> {
-  const { ToolRegistry } = require("./tools");
   const registry = new ToolRegistry();
   const registered = registry.list();
 
@@ -404,7 +405,6 @@ function buildToolSet(config: any): Array<{
       description: "Run a shell command. Returns stdout (max 2000 chars). Timeout: 15s.",
       parameters: { command: "string" },
       execute: async (params: Record<string, unknown>) => {
-        const { spawnSync } = require("child_process");
         try {
           const result = spawnSync("sh", ["-c", params.command as string], {
             encoding: "utf-8", timeout: 15000, maxBuffer: 2 * 1024 * 1024,
@@ -423,7 +423,6 @@ function buildToolSet(config: any): Array<{
       description: "Search files by name pattern using find. Returns file paths.",
       parameters: { pattern: "string", directory: "string?" },
       execute: async (params: Record<string, unknown>) => {
-        const { spawnSync } = require("child_process");
         try {
           const dir = (params.directory as string) || ".";
           const result = spawnSync("find", [dir, "-name", params.pattern as string, "-type", "f"], {
@@ -444,7 +443,6 @@ function buildToolSet(config: any): Array<{
       description: "Search file contents by regex pattern. Returns matching lines.",
       parameters: { pattern: "string", path: "string?" },
       execute: async (params: Record<string, unknown>) => {
-        const { spawnSync } = require("child_process");
         try {
           const args = ["-rn", params.pattern as string];
           if (params.path) args.push(params.path as string);
