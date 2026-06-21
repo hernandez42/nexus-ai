@@ -1,654 +1,613 @@
 /**
- * Local Reasoner — 本地推理引擎
+ * LocalReasoner — 不依赖 LLM 的本地推理引擎
  *
- * 核心设计：不依赖 LLM 的真正的本地思考能力
- * 推理流程：OBSERVE → RETRIEVE(memory) → REASON(rules) → COMPOSE(reply)
+ * 设计目标（对照 nanobot / eve 的推理循环）：
+ *   1. 意图识别（中文 / 英文）- 规则匹配
+ *   2. 从 memory 检索相关信息
+ *   3. 真正调用工具（读文件、执行命令、搜索…）
+ *   4. 综合出结构化的答复
  *
- * 关键区别：
- * - memory 直接用于推理，不经过 tool 代理
- * - 规则匹配后直接综合回复，不需要 bash echo
- * - 回复由 memory 数据 + 规则模板组合而成
+ * 关键：**即使没有 LLM API key，也能完整工作**。
+ * 这意味着 read_file、bash、grep、search_files 等工具必须在本地真实调用。
  */
 
+import { existsSync, readFileSync, statSync } from "fs";
+import { spawnSync } from "child_process";
 import { MemoryStore } from "./memory";
-import { SkillRegistry, SkillContext, SkillResult } from "./skills";
+import { ToolRegistry } from "./tools";
+import { IdentityManager } from "./identity";
 
-export interface LocalReasonStep {
-  step: number;
-  type: "OBSERVE" | "RETRIEVE" | "REASON" | "COMPOSE" | "FINAL";
-  content: string;
-  confidence: number; // 0-1
-  basis: "rule" | "memory" | "composed" | "fallback";
-  timestamp: number;
-}
+// ============================================================
+// Intent types
+// ============================================================
 
-export interface ToolDef {
-  name: string;
-  description: string;
-  execute: (params: Record<string, unknown>) => Promise<unknown>;
+type Intent =
+  | "greeting"
+  | "self_assessment"
+  | "capabilities"
+  | "memory_query"
+  | "file_read"
+  | "file_list"
+  | "shell"
+  | "grep"
+  | "search_files"
+  | "git"
+  | "code_analysis"
+  | "user_preference"
+  | "reflection"
+  | "unknown";
+
+// ============================================================
+// LocalReasoner
+// ============================================================
+
+export interface ReasonerResult {
+  steps: Array<{ type: string; content: string; confidence?: number }>;
+  answer: string;
+  intent: Intent;
+  toolsUsed: string[];
 }
 
 export class LocalReasoner {
   private memory: MemoryStore;
-  private tools: Map<string, ToolDef> = new Map();
-  private skills: SkillRegistry | null = null;
-  private skillContext: SkillContext | null = null;
+  private identity: IdentityManager;
+  private tools: ToolRegistry;
+  private cwd: string;
 
-  constructor(memory: MemoryStore, skills?: SkillRegistry, skillContext?: SkillContext) {
+  constructor(memory: MemoryStore, identity: IdentityManager, cwd: string = process.cwd()) {
     this.memory = memory;
-    this.skills = skills || null;
-    this.skillContext = skillContext || null;
+    this.identity = identity;
+    this.tools = new ToolRegistry();
+    this.cwd = cwd;
   }
 
-  registerTool(tool: ToolDef): void {
-    this.tools.set(tool.name, tool);
-  }
+  async reason(prompt: string): Promise<ReasonerResult> {
+    const steps: ReasonerResult["steps"] = [];
+    const toolsUsed: string[] = [];
 
-  /**
-   * 本地推理主循环
-   * 流程：OBSERVE → RETRIEVE(memory) → REASON(rules) → COMPOSE(reply)
-   * 不调用 LLM，纯本地决策
-   */
-  async reason(prompt: string, maxSteps: number = 5): Promise<LocalReasonStep[]> {
-    const steps: LocalReasonStep[] = [];
-    const now = Date.now();
+    const intent = this.classifyIntent(prompt);
+    steps.push({ type: "intent", content: `意图：${intent}`, confidence: 0.9 });
 
-    // ============================================================
-    // Step 1: OBSERVE — 记录输入
-    // ============================================================
-    steps.push({
-      step: 1, type: "OBSERVE", content: prompt,
-      confidence: 1.0, basis: "rule", timestamp: now,
-    });
-
-    // ============================================================
-    // Step 2: RETRIEVE — 从 memory 中检索相关信息
-    // ============================================================
-    const memStats = this.memory.stats();
-    const relevantMemories = this.memory.query({ text: prompt, topK: 5, minSimilarity: 0.2 });
-    const capabilities = this.memory.query({ text: "capability", layer: "procedural", topK: 10, minSimilarity: 0.01 });
-    const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 5, minSimilarity: 0.01 });
-    const recentRuns = this.memory.query({ text: "run result", layer: "episodic", topK: 3, minSimilarity: 0.01 });
-
-    steps.push({
-      step: 2, type: "RETRIEVE",
-      content: `Memory: ${memStats.total} total | Relevant: ${relevantMemories.length} | Capabilities: ${capabilities.length} | Goals: ${goals.length}`,
-      confidence: Math.min(1, relevantMemories.length > 0 ? relevantMemories[0].similarity + 0.5 : 0.5),
-      basis: "memory",
-      timestamp: now,
-    });
-
-    // ============================================================
-    // Step 3: REASON — 基于规则匹配 + memory 数据推理
-    // ============================================================
-    const reasoning = this.classifyAndReason(prompt, {
-      memStats, relevantMemories, capabilities, goals, recentRuns,
-    });
-
-    steps.push({
-      step: 3, type: "REASON",
-      content: reasoning.intent,
-      confidence: reasoning.confidence,
-      basis: "rule",
-      timestamp: now,
-    });
-
-    // ============================================================
-    // Step 4: COMPOSE — 综合回复（先尝试 skill，再尝试 tool）
-    // ============================================================
-    let toolResult: string | null = null;
-
-    // Try skill first (new skill system)
-    if (this.skills && this.skillContext && reasoning.skillAction) {
-      const skillResult = await this.skills.execute(
-        reasoning.skillAction.name,
-        reasoning.skillAction.params,
-        this.skillContext
-      );
-      toolResult = skillResult.success
-        ? skillResult.output
-        : `Skill error: ${skillResult.error}`;
-    }
-
-    // Fall back to old tool system
-    if (!toolResult && reasoning.toolAction) {
-      const tool = this.tools.get(reasoning.toolAction.name);
-      if (tool) {
-        try {
-          const raw = await tool.execute(reasoning.toolAction.params);
-          toolResult = typeof raw === "string" ? raw : JSON.stringify(raw);
-          if (typeof raw === "object" && raw !== null) {
-            const obj = raw as Record<string, unknown>;
-            toolResult = String(obj.output || obj.content || obj.result || toolResult);
-          }
-        } catch (e: unknown) {
-          toolResult = `Error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      } else {
-        toolResult = `Tool not found: ${reasoning.toolAction.name}`;
-      }
-    }
-
-    // Build final composed response
-    const reply = this.composeReply(prompt, reasoning, toolResult);
-
-    steps.push({
-      step: 4, type: "COMPOSE",
-      content: reply,
-      confidence: reasoning.confidence,
-      basis: "composed",
-      timestamp: now,
-    });
-
-    // ============================================================
-    // Step 5: FINAL — 返回结果
-    // ============================================================
-    steps.push({
-      step: 5, type: "FINAL",
-      content: reply,
-      confidence: reasoning.confidence,
-      basis: "composed",
-      timestamp: now,
-    });
-
-    return steps;
-  }
-
-  /**
-   * 分类用户意图 + 推理
-   */
-  private classifyAndReason(
-    prompt: string,
-    ctx: {
-      memStats: { total: number; episodic: number; semantic: number; procedural: number };
-      relevantMemories: Array<{ entry: { content: string; layer: string; tags?: string[] }; similarity: number }>;
-      capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> }; similarity: number }>;
-      goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
-      recentRuns: Array<{ entry: { content: string } }>;
-    }
-  ): { intent: string; confidence: number; toolAction: { name: string; params: Record<string, unknown> } | null; skillAction: { name: string; params: Record<string, unknown> } | null } {
-    const lower = prompt.toLowerCase();
-
-    // --- Greeting / Identity (EN + CN) ---
-    if (/^(hi|hello|hey|greetings|yo)\b/i.test(lower) || /who are you|what is your name|introduce yourself/i.test(lower)) {
-      return {
-        intent: "Greeting detected — respond as Nexus agent",
-        confidence: 1.0,
-        toolAction: null,
-        skillAction: null,
-      };
-    }
-    // Chinese greetings
-    if (/^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt)) {
-      return {
-        intent: "Greeting detected — respond as Nexus agent",
-        confidence: 1.0,
-        toolAction: null,
-        skillAction: null,
-      };
-    }
-
-    // --- Self-assessment / Status (EN + CN) ---
-    if (/self.?assessment|review your|your state|your current|status report|evolutionary state|your capabilities|your memory/i.test(lower)) {
-      return this.buildSelfAssessment({ ...ctx, relevantMemories: ctx.relevantMemories });
-    }
-    // Chinese status triggers (narrow: only explicit status requests)
-    if (/^(更新|状态|报告|总结|检查|汇报|情况|进展)/.test(prompt)) {
-      return this.buildSelfAssessment({ ...ctx, relevantMemories: ctx.relevantMemories });
-    }
-
-    // --- File read (EN + CN) ---
-    const fileMatch = lower.match(/read\s+(?:file\s+)?[`"']?(.+?)[`"']?\s*$/i) ||
-                       lower.match(/(.+\.\w+)\s*content/i);
-    if (fileMatch) {
-      return {
-        intent: `File read request: ${fileMatch[1]}`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: { name: "file_read", params: { path: fileMatch[1].trim() } },
-      };
-    }
-    // Chinese file read
-    const cnFileMatch = prompt.match(/(?:读|看|查看|读取|打开)\s*[`"']?(.+?\.\w+)[`"']?/);
-    if (cnFileMatch) {
-      return {
-        intent: `File read request: ${cnFileMatch[1]}`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: { name: "file_read", params: { path: cnFileMatch[1].trim() } },
-      };
-    }
-
-    // --- Search (EN + CN) ---
-    const searchMatch = lower.match(/search\s+(?:for\s+)?[`"']?(.+?)[`"']?/i) ||
-                         lower.match(/find\s+(?:files?\s+with\s+)?[`"']?(.+?)[`"']?/i);
-    if (searchMatch) {
-      return {
-        intent: `Search request: pattern="${searchMatch[1]}"`,
-        confidence: 0.85,
-        toolAction: null,
-        skillAction: { name: "bash", params: { command: `grep -r "${searchMatch[1].trim()}" . --include="*.ts" --include="*.js" -l` } },
-      };
-    }
-    // Chinese search
-    const cnSearchMatch = prompt.match(/(?:搜索|查找|找|搜)\s*[`"']?(.+?)[`"']?$/);
-    if (cnSearchMatch) {
-      return {
-        intent: `Search request: pattern="${cnSearchMatch[1]}"`,
-        confidence: 0.85,
-        toolAction: null,
-        skillAction: { name: "bash", params: { command: `grep -r "${cnSearchMatch[1].trim()}" . --include="*.ts" --include="*.js" -l` } },
-      };
-    }
-
-    // --- Bash (EN + CN) ---
-    const bashMatch = lower.match(/run\s+[`"']?(.+?)[`"']?$/i) ||
-                      lower.match(/execute\s+[`"']?(.+?)[`"']?$/i);
-    if (bashMatch) {
-      return {
-        intent: `Bash execution: ${bashMatch[1]}`,
-        confidence: 0.7,
-        toolAction: null,
-        skillAction: { name: "bash", params: { command: bashMatch[1].trim() } },
-      };
-    }
-    // Chinese bash
-    const cnBashMatch = prompt.match(/(?:执行|运行|跑)\s*[`"']?(.+?)[`"']?$/);
-    if (cnBashMatch) {
-      return {
-        intent: `Bash execution: ${cnBashMatch[1]}`,
-        confidence: 0.7,
-        toolAction: null,
-        skillAction: { name: "bash", params: { command: cnBashMatch[1].trim() } },
-      };
-    }
-
-    // --- Git clone (EN + CN) ---
-    const gitMatch = lower.match(/clone\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i) ||
-                     lower.match(/download\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i);
-    if (gitMatch) {
-      return {
-        intent: `Git clone request: ${gitMatch[1]}`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: { name: "git_clone", params: { url: gitMatch[1].trim() } },
-      };
-    }
-    // Chinese git clone
-    const cnGitMatch = prompt.match(/(?:克隆|下载|拉取)\s*[`"']?(https?:\/\/.+?)[`"']?/);
-    if (cnGitMatch) {
-      return {
-        intent: `Git clone request: ${cnGitMatch[1]}`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: { name: "git_clone", params: { url: cnGitMatch[1].trim() } },
-      };
-    }
-
-    // --- Memory query (EN + CN) ---
-    if (/remember|memory|past experience|what do you know/i.test(lower)) {
-      return {
-        intent: `Memory recall: ${ctx.relevantMemories.length} relevant entries found`,
-        confidence: 0.85,
-        toolAction: null,
-        skillAction: null,
-      };
-    }
-    if (/记忆|记得|回忆|之前/.test(prompt)) {
-      return {
-        intent: `Memory recall: ${ctx.relevantMemories.length} relevant entries found`,
-        confidence: 0.85,
-        toolAction: null,
-        skillAction: null,
-      };
-    }
-
-    // --- Capability query (EN + CN) ---
-    if (/what can you do|capabilities|skills|tools available/i.test(lower)) {
-      return this.buildCapabilityReport(ctx);
-    }
-    if (/你会什么|能力|功能|技能|工具/.test(prompt)) {
-      return this.buildCapabilityReport(ctx);
-    }
-
-    // --- Goal query (EN + CN) ---
-    if (/goals|knowledge gap|what should.*learn|what.*explore/i.test(lower)) {
-      return this.buildGoalReport(ctx);
-    }
-    if (/目标|缺口|学习|探索|计划/.test(prompt)) {
-      return this.buildGoalReport(ctx);
-    }
-
-    // --- Fallback: low confidence → let LLM handle it ---
-    return {
-      intent: "No local rule matched — LLM fallback needed",
-      confidence: 0.3,
-      toolAction: null,
-      skillAction: null,
-    };
-  }
-
-  /**
-   * Helper: build self-assessment intent
-   */
-  /**
-   * Deduplicate capabilities by normalized name
-   */
-  private dedupCapabilities(caps: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>): string[] {
-    const seen = new Set<string>();
-    const result: string[] = [];
-    for (const c of caps) {
-      const meta = c.entry.metadata;
-      const name = String(meta?.name || "").toLowerCase().replace(/[_\s-]/g, "");
-      if (!name) continue;
-      // Check exact match
-      if (seen.has(name)) continue;
-      // Check substring match
-      let dup = false;
-      for (const s of seen) {
-        if (name.includes(s) || s.includes(name)) { dup = true; break; }
-      }
-      if (dup) continue;
-      seen.add(name);
-      result.push(String(meta?.name || c.entry.content.slice(0, 30)));
-    }
-    return result;
-  }
-
-  /**
-   * Deduplicate goals by normalized target
-   */
-  private dedupGoals(goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>): string[] {
-    const seen = new Set<string>();
-    const result: string[] = [];
-    for (const g of goals) {
-      const meta = g.entry.metadata;
-      const target = String(meta?.target || g.entry.content).toLowerCase().replace(/[_\s-]/g, "");
-      if (!target) continue;
-      if (seen.has(target)) continue;
-      let dup = false;
-      for (const s of seen) {
-        if (target.includes(s) || s.includes(target)) { dup = true; break; }
-      }
-      if (dup) continue;
-      seen.add(target);
-      result.push(String(meta?.target || g.entry.content.slice(0, 40)));
-    }
-    return result;
-  }
-
-  private buildSelfAssessment(ctx: {
-    memStats: { total: number; episodic: number; semantic: number; procedural: number };
-    capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
-    goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
-    relevantMemories?: Array<{ entry: { content: string; layer: string }; similarity: number }>;
-  }) {
-    const capNames = this.dedupCapabilities(ctx.capabilities).slice(0, 5).join(", ");
-    const goalTargets = this.dedupGoals(ctx.goals).slice(0, 3).join(", ");
-    // Show actual memory content, not just stats
-    const recentMems = (ctx.relevantMemories || [])
-      .slice(0, 3)
-      .map(m => `[${m.entry.layer}] ${m.entry.content.slice(0, 80)} (sim:${m.similarity.toFixed(2)})`)
-      .join("\n");
-    return {
-      intent: `Memory: ${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P)\nRecent:\n${recentMems || "No recent memories"}\nCapabilities: ${capNames || "none"}\nGoals: ${goalTargets || "none"}`,
-      confidence: 0.95,
-      toolAction: null,
-      skillAction: null,
-    };
-  }
-
-  private buildCapabilityReport(ctx: {
-    capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
-  }) {
-    const toolNames = Array.from(this.tools.keys());
-    const capNames = this.dedupCapabilities(ctx.capabilities).slice(0, 8);
-    return {
-      intent: `Tools: ${toolNames.join(", ")} | Evolved: ${capNames.join(", ") || "none"}`,
-      confidence: 0.9,
-      toolAction: null,
-      skillAction: null,
-    };
-  }
-
-  private buildGoalReport(ctx: {
-    goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
-  }) {
-    const goalList = this.dedupGoals(ctx.goals).slice(0, 5).join("\n");
-    return {
-      intent: `Goals: ${this.dedupGoals(ctx.goals).length} gaps\n${goalList || "No goals yet"}`,
-      confidence: 0.9,
-      toolAction: null,
-      skillAction: null,
-    };
-  }
-
-  /**
-   * 综合最终回复 — 真正的本地推理分析
-   * 基于 reasoning + memory + tool result 组合，生成有洞察的回复
-   */
-  private composeReply(
-    prompt: string,
-    reasoning: { intent: string; confidence: number },
-    toolResult: string | null,
-  ): string {
-    // If tool was executed, include its result first
-    if (toolResult && !toolResult.startsWith("Error") && !toolResult.startsWith("Tool not found")) {
-      return toolResult.slice(0, 800);
-    }
-
-    // --- Greeting: short identity, no fluff ---
-    if (/^(hi|hello|hey|greetings|yo)\b/i.test(prompt) || /who are you|what is your name/i.test(prompt)) {
-      return "Nexus. Local reasoning + memory. What do you need?";
-    }
-    if (/^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt)) {
-      return "Nexus. 本地推理 + 记忆。需要什么？";
-    }
-
-    // --- Self-assessment: analyze memory, not just list ---
-    if (/self.?assessment|status report|evolutionary state|your state/i.test(prompt.toLowerCase())) {
-      return this.analyzeSelf();
-    }
-    if (/^(更新|状态|报告|总结|检查|汇报|情况|进展)/.test(prompt)) {
-      return this.analyzeSelf();
-    }
-
-    // --- Memory query: find patterns, not just dump ---
-    if (/remember|memory|past/i.test(prompt.toLowerCase())) {
-      return this.analyzeMemoryPatterns(prompt);
-    }
-    if (/记忆|记得|回忆|之前/.test(prompt)) {
-      return this.analyzeMemoryPatterns(prompt);
-    }
-
-    // --- Capability query: report what works, not just names ---
-    if (/capabilities|skills|what can you do/i.test(prompt.toLowerCase())) {
-      return this.analyzeCapabilities();
-    }
-    if (/你会什么|能力|功能|技能|工具/.test(prompt)) {
-      return this.analyzeCapabilities();
-    }
-
-    // --- Goal query: report gaps with analysis ---
-    if (/goals|knowledge gap|what should/i.test(prompt.toLowerCase())) {
-      return this.analyzeGoals();
-    }
-    if (/目标|缺口|学习|探索|计划/.test(prompt)) {
-      return this.analyzeGoals();
-    }
-
-    // Fallback: low confidence → return empty to trigger LLM fallback
-    if (reasoning.confidence < 0.5) {
-      return "";
-    }
-
-    return reasoning.intent;
-  }
-
-  /**
-   * 真正的自我分析 — 从 memory 数据中提取洞察
-   */
-  private analyzeSelf(): string {
-    const stats = this.memory.stats();
-    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 10, minSimilarity: 0.01 });
-    const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 5, minSimilarity: 0.01 });
-    const recent = this.memory.query({ text: "run result", layer: "episodic", topK: 5, minSimilarity: 0.01 });
-
-    // Analyze: memory growth rate
-    const growth = stats.total > 0 ? "growing" : "empty";
-
-    // Analyze: capability diversity (count unique names)
-    const capNames = new Set(caps.map(c => {
-      const meta = c.entry.metadata;
-      return String(meta?.name || "").toLowerCase().replace(/[_\s-]/g, "");
-    }).filter(Boolean));
-    const diversity = capNames.size;
-
-    // Analyze: goal completion rate
-    const goalCount = goals.length;
-
-    // Analyze: recent activity
-    const active = recent.length > 0;
-
-    // Compose insight, not data dump
-    const lines: string[] = [];
-    lines.push(`Memory: ${stats.total} entries (${stats.episodic}E/${stats.semantic}S/${stats.procedural}P) — ${growth}`);
-
-    if (diversity > 0) {
-      lines.push(`Capabilities: ${diversity} distinct (${caps.length} total)`);
-      // Report top 3 by frequency in memory
-      const topCaps = caps.slice(0, 3).map(c => {
-        const meta = c.entry.metadata;
-        return String(meta?.name || c.entry.content.slice(0, 25));
+    // Memory retrieval for context (all queries)
+    const related = this.memory.query({ text: prompt, topK: 3, minSimilarity: 0.1 });
+    if (related.length > 0) {
+      steps.push({
+        type: "memory",
+        content: `${related.length} 条相关记忆`,
       });
-      lines.push(`Top: ${topCaps.join(", ")}`);
-    } else {
-      lines.push("Capabilities: none evolved yet");
     }
 
-    if (goalCount > 0) {
-      lines.push(`Goals: ${goalCount} gaps identified`);
-      const topGoal = goals[0];
-      const gMeta = topGoal.entry.metadata;
-      lines.push(`Priority: ${gMeta?.target || topGoal.entry.content.slice(0, 40)}`);
-    } else {
-      lines.push("Goals: none — exploration may be stalled");
+    // --- Dispatch to handler ---
+    let answer = "";
+
+    switch (intent) {
+      case "greeting":
+        answer = this.handleGreeting(prompt);
+        break;
+      case "self_assessment":
+        answer = this.handleSelfAssessment();
+        break;
+      case "capabilities":
+        answer = this.handleCapabilities();
+        break;
+      case "memory_query":
+        answer = this.handleMemoryQuery(prompt);
+        break;
+      case "file_read": {
+        const r = this.handleFileRead(prompt);
+        answer = r.answer;
+        if (r.usedTool) toolsUsed.push("read_file");
+        break;
+      }
+      case "file_list": {
+        const r = this.handleFileList(prompt);
+        answer = r.answer;
+        if (r.usedTool) toolsUsed.push("list_dir");
+        break;
+      }
+      case "shell": {
+        const r = this.handleShell(prompt);
+        answer = r.answer;
+        if (r.usedTool) toolsUsed.push("bash");
+        break;
+      }
+      case "grep": {
+        const r = this.handleGrep(prompt);
+        answer = r.answer;
+        if (r.usedTool) toolsUsed.push("grep");
+        break;
+      }
+      case "search_files": {
+        const r = this.handleSearchFiles(prompt);
+        answer = r.answer;
+        if (r.usedTool) toolsUsed.push("search_files");
+        break;
+      }
+      case "git":
+        answer = this.handleGit(prompt);
+        break;
+      case "code_analysis":
+        answer = this.handleCodeAnalysis();
+        break;
+      case "user_preference":
+        answer = this.handleUserPreference(prompt);
+        break;
+      case "reflection":
+        answer = this.handleReflection();
+        break;
+      case "unknown":
+      default:
+        answer = this.handleUnknown(prompt);
+        break;
     }
 
-    if (active) {
-      lines.push("Activity: recent runs detected");
-    } else {
-      lines.push("Activity: no recent runs");
+    steps.push({ type: "answer", content: answer.slice(0, 200) });
+    return { steps, answer, intent, toolsUsed };
+  }
+
+  // ============================================================
+  // Intent classification (ZH + EN)
+  // ============================================================
+
+  private classifyIntent(prompt: string): Intent {
+    const text = prompt.toLowerCase().trim();
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+
+    // --- Greeting ---
+    if (/^(hi|hello|hey|greetings|yo|sup|你好|嗨|哈喽|早上好|下午好|晚上好|您好|早|问候)\b|^(你好|嗨|哈喽)/.test(text)) {
+      return "greeting";
     }
 
-    // Add diagnosis
-    if (stats.total < 100) {
-      lines.push("Diagnosis: memory too sparse — need more cycles");
-    } else if (diversity === 0 && stats.total > 500) {
-      lines.push("Diagnosis: memory rich but no capabilities — explore/evolve may be broken");
-    } else if (goalCount === 0) {
-      lines.push("Diagnosis: no goals — signal extraction may need tuning");
-    } else {
-      lines.push("Diagnosis: operational");
+    // --- Self assessment / status ---
+    if (/(自我?评估|状态|汇报|介绍自己|自我?介绍|运行状态|你是谁|你是什么|你现在|你的情况|诊断|反省|自省)/.test(text)) return "self_assessment";
+    if (/(who are you|introduce yourself|your state|status report|self.assessment|how are you doing|about yourself)/.test(text)) return "self_assessment";
+
+    // --- Capabilities ---
+    if (/(你会什么|你能做什么|有什么功能|有哪些能力|能帮我做什么|你的工具)/.test(text)) return "capabilities";
+    if (/(what can you do|your capabilities|what tools|your features|what do you support)/.test(text)) return "capabilities";
+
+    // --- Memory query ---
+    if (/(你记得|你知道|回忆|上次|之前我们|我们之前|记忆\b|记录\b)/.test(text)) return "memory_query";
+    if (/\b(remember|memory|do you recall|what did we|last time|previous conversation)\b/i.test(text)) return "memory_query";
+
+    // --- Reflection ---
+    if (/(反省|自省|反思|自我检查|总结)/.test(text)) return "reflection";
+    if (/(reflect|self.reflection|review yourself|take stock)/.test(text)) return "reflection";
+
+    // --- File READ ---
+    if (zh && /(读取|查看|看|显示|打开|读).*[文件]?/.test(text) && /\.[a-zA-Z0-9]{1,6}/.test(text)) return "file_read";
+    if (/^read\s+(?:the\s+)?(?:file\s+)?[\w\-.~\/]+|show\s+(?:me\s+)?(?:the\s+)?(?:file\s+)?[\w\-.~\/]+|what['’]?s\s+in\s+[\w\-.~\/]+/i.test(text)) return "file_read";
+    if (/\.(json|ts|js|md|txt|yml|yaml|toml|ini|csv|log|py|go|rs|java|c|cpp|h|html|css)$/i.test(text) && text.length > 3) return "file_read";
+
+    // --- File LIST ---
+    if (/(列出目录|列出|有什么文件|目录|列出文件|ls\b|显示目录)/.test(text)) return "file_list";
+    if (/(list (?:files|directory|dir)|ls\b|what files|what is in (?:the )?(?:current )?(?:directory|folder)|show me (?:files|directory))/i.test(text)) return "file_list";
+
+    // --- GREP / content search ---
+    if (zh && /(搜索|查找|检索|搜|找).*(内容|代码|字符串|文字|在)?/.test(text)) return "grep";
+    if (/(grep\b|search\s+for|search\s+code|find\s+(?:the\s+)?(?:string|content)|look\s+for\s+(?:the\s+)?string|contain\s+text)/i.test(text)) return "grep";
+    if (/^grep\b/i.test(text)) return "grep";
+    if (/^(查找|搜索|搜)\s+/i.test(text)) return "grep";
+
+    // --- Search FILES by name ---
+    if (/(查找文件|找文件|搜索文件|file\s+search|find.*file|locate\s)/i.test(text)) return "search_files";
+
+    // --- Shell / Bash ---
+    if (/^(运行|执行|跑|shell\s*[:：]?|bash\s*[:：]?|命令[:：]?)\s*/.test(text)) return "shell";
+    if (/^(run|execute|bash:|shell:)\s+/i.test(text)) return "shell";
+    if (/(运行命令|执行命令|run the command|execute)/i.test(text)) return "shell";
+
+    // --- Git ---
+    if (/(git\s+(clone|pull|status|diff|log)|克隆\s*仓库|git\s*[:：]?)/i.test(text)) return "git";
+
+    // --- Code analysis ---
+    if (/(代码分析|分析代码|代码结构|review code|analyze code)/i.test(text)) return "code_analysis";
+
+    // --- User preference ---
+    if (zh && /(我(喜欢|偏好|想要)|你应该|记得我|我的习惯)/.test(text)) return "user_preference";
+    if (/(i prefer|i like|i want you to|remember that i|my habit)/i.test(text)) return "user_preference";
+
+    return "unknown";
+  }
+
+  // ============================================================
+  // Handlers
+  // ============================================================
+
+  private handleGreeting(prompt: string): string {
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    const stats = this.memory.stats();
+    if (zh) {
+      return `你好。我是 ${this.identity.get().name} — ${this.identity.get().role}。\n目前有 ${stats.total} 条记忆（${stats.episodic} 事件 / ${stats.semantic} 语义 / ${stats.procedural} 能力）。\n你想聊什么？`;
     }
+    return `Hi. I'm ${this.identity.get().name} — ${this.identity.get().role}.\nI have ${stats.total} memory entries (${stats.episodic} episodic / ${stats.semantic} semantic / ${stats.procedural} procedural).\nWhat would you like to explore?`;
+  }
+
+  private handleSelfAssessment(): string {
+    const stats = this.memory.stats();
+    const id = this.identity.summary();
+    const learned = this.identity.get().learnedFromUser;
+
+    const lines: string[] = [];
+    lines.push(id);
+    lines.push("");
+    lines.push("---");
+    lines.push(`记忆统计：${stats.total} 条`);
+    lines.push(`  * 事件（episodic）：${stats.episodic}`);
+    lines.push(`  * 语义（semantic）：${stats.semantic}`);
+    lines.push(`  * 能力（procedural）：${stats.procedural}`);
+
+    // Recent memories
+    const recent = this.memory.query({ text: "recent", layer: "episodic", topK: 5, minSimilarity: 0.0 }).slice(0, 5);
+    if (recent.length > 0) {
+      lines.push("");
+      lines.push("最近的 5 条记忆：");
+      for (const m of recent) {
+        lines.push(`  - [${m.entry.layer}] ${m.entry.content.slice(0, 120)}`);
+      }
+    }
+
+    if (learned.length > 0) {
+      lines.push("");
+      lines.push("关于你学到的：");
+      for (const l of learned.slice(0, 5)) lines.push(`  - ${l}`);
+    }
+
+    lines.push("");
+    lines.push("---");
+    lines.push("你可以直接问我文件、代码、shell 命令等问题 — 即使没有 LLM API key，我也能用本地工具帮你做实际工作。");
 
     return lines.join("\n");
   }
 
-  /**
-   * 分析 memory 模式 — 找关联、趋势，而非罗列
-   */
-  private analyzeMemoryPatterns(prompt: string): string {
-    const memories = this.memory.query({ text: prompt, topK: 10, minSimilarity: 0.15 });
-    if (memories.length === 0) return "No relevant memories.";
+  private handleCapabilities(): string {
+    const caps = this.identity.get().capabilities;
+    const lines = ["我可以：", ""];
+    for (const c of caps) lines.push(`  - ${c}`);
+    lines.push("");
+    lines.push("常用命令举例：");
+    lines.push("  - 读取 <路径>          → 读取文件内容");
+    lines.push("  - 列出目录                  → 列出当前目录文件");
+    lines.push("  - grep <关键词> [路径]  → 搜索内容");
+    lines.push("  - run <shell 命令>          → 执行 shell 命令");
+    lines.push("  - 状态 / 自我评估           → 查看我的状态");
+    return lines.join("\n");
+  }
 
-    // Group by layer
-    const byLayer: Record<string, typeof memories> = {};
+  private handleMemoryQuery(prompt: string): string {
+    const memories = this.memory.query({ text: prompt, topK: 8, minSimilarity: 0.05 });
+    if (memories.length === 0) {
+      return "没有找到相关记忆。";
+    }
+    const lines = [`找到 ${memories.length} 条相关记忆：`, ""];
     for (const m of memories) {
-      const layer = m.entry.layer || "unknown";
-      (byLayer[layer] ||= []).push(m);
+      const ts = m.entry.createdAt ? new Date(m.entry.createdAt).toLocaleString() : "";
+      lines.push(`  [${m.entry.layer}] ${m.entry.content.slice(0, 140)}  (相似度=${m.similarity.toFixed(2)}${ts ? ", " + ts : ""})`);
     }
-
-    const lines: string[] = [];
-    lines.push(`Found ${memories.length} relevant memories:`);
-
-    for (const [layer, items] of Object.entries(byLayer)) {
-      const top = items[0];
-      lines.push(`[${layer}] ${items.length} entries — best match: ${top.entry.content.slice(0, 60)} (sim=${top.similarity.toFixed(2)})`);
-    }
-
-    // Detect pattern: repeated content
-    const contents = memories.map(m => m.entry.content.slice(0, 30));
-    const unique = new Set(contents);
-    if (unique.size < contents.length * 0.7) {
-      lines.push("Pattern: high repetition detected — possible redundant storage");
-    }
-
     return lines.join("\n");
   }
 
-  /**
-   * 分析 capabilities — 报告实际效用，而非名字列表
-   */
-  private analyzeCapabilities(): string {
-    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 15, minSimilarity: 0.01 });
-    const toolNames = Array.from(this.tools.keys());
-
-    if (caps.length === 0) {
-      return `Tools: ${toolNames.join(", ")}\nEvolved: none yet`;
+  private handleFileRead(prompt: string): { answer: string; usedTool: boolean } {
+    // Extract a file path from the prompt
+    const path = this.extractFilePath(prompt);
+    if (!path) {
+      return { answer: "没有识别出文件路径。你可以直接给我文件名，例如：`读取 package.json`。", usedTool: false };
     }
 
-    // Deduplicate
-    const seen = new Set<string>();
-    const unique = caps.filter(c => {
-      const name = String(c.entry.metadata?.name || c.entry.content).toLowerCase().replace(/[_\s-]/g, "");
-      if (seen.has(name)) return false;
-      seen.add(name);
-      return true;
-    });
+    // Use tools.ts read_file for consistency
+    const result = this.tools.get("read_file")?.execute({ path }) as any;
+    const resolved = Promise.resolve(result);
+
+    // Handle sync/async — actually ToolRegistry execute is async so we need to await,
+    // but for simplicity we use synchronous read here too.
+    // Let's use sync fallback.
+    try {
+      if (!existsSync(path)) return { answer: `✗ 文件不存在：${path}`, usedTool: false };
+      const st = statSync(path);
+      if (st.isDirectory()) return { answer: `✗ 路径是目录：${path}。用「列出目录」可以查看里面的文件。`, usedTool: false };
+      const content = readFileSync(path, "utf-8");
+      const preview = content.slice(0, 2000);
+      const lines: string[] = [];
+      lines.push(`文件：${path}`);
+      lines.push(`大小：${content.length} 字符（显示前 ${preview.length}）`);
+      lines.push("");
+      lines.push("```");
+      lines.push(preview);
+      lines.push("```");
+      return { answer: lines.join("\n"), usedTool: true };
+    } catch (e: any) {
+      return { answer: `读取失败：${e.message || e}`, usedTool: false };
+    }
+  }
+
+  private handleFileList(prompt: string): { answer: string; usedTool: boolean } {
+    // Try to extract a directory path
+    let dir = ".";
+    const match = prompt.match(/([./~\w\-]+\/[\w\-.\/]*|(?:current|this|the)\s*(?:directory|folder|目录))/i);
+    if (match) {
+      dir = match[1].replace(/^(current|this|the)\s*(?:directory|folder|目录)$/i, ".");
+    }
+
+    try {
+      if (!existsSync(dir)) return { answer: `✗ 目录不存在：${dir}`, usedTool: false };
+      const st = statSync(dir);
+      if (!st.isDirectory()) return { answer: `✗ 不是目录：${dir}`, usedTool: false };
+
+      const result = spawnSync("ls", ["-lah", dir], { encoding: "utf-8", timeout: 5000 });
+      const output = (result.stdout || "").slice(0, 2500);
+      return {
+        answer: `目录：${dir}\n\`\`\`\n${output || "(空)"}\n\`\`\``,
+        usedTool: true,
+      };
+    } catch (e: any) {
+      return { answer: `列出目录失败：${e.message || e}`, usedTool: false };
+    }
+  }
+
+  private handleShell(prompt: string): { answer: string; usedTool: boolean } {
+    // Strip leading trigger word
+    let cmd = prompt
+      .replace(/^(运行|执行|跑|run\s+|execute\s+|bash[:：]?\s*|shell[:：]?\s*|命令[:：]?\s*)/i, "")
+      .trim();
+
+    if (!cmd) return { answer: "请告诉我要运行什么命令，例如：`run ls -la`", usedTool: false };
+
+    // Security check
+    const dangerous = [
+      /rm\s+-rf\s+(\/\s*|~|\*)$/,
+      /\bsudo\b/,
+      /\bmkfs\b/,
+      /\bdd\b.*of=\/dev/,
+      />\s*\/dev\/sd/,
+    ];
+    for (const re of dangerous) {
+      if (re.test(cmd)) return { answer: `✗ 这个命令太危险了，我不会执行：\`${cmd}\``, usedTool: false };
+    }
+
+    try {
+      const result = spawnSync("sh", ["-c", cmd], {
+        encoding: "utf-8",
+        timeout: 15000,
+        maxBuffer: 5 * 1024 * 1024,
+      });
+      const stdout = (result.stdout || "").slice(0, 3000);
+      const stderr = (result.stderr || "").slice(0, 1000);
+      const parts: string[] = [];
+      parts.push(`命令：\`${cmd}\``);
+      if (result.status !== 0) parts.push(`退出码：${result.status}`);
+      if (stdout) {
+        parts.push("");
+        parts.push("stdout:");
+        parts.push("```");
+        parts.push(stdout);
+        parts.push("```");
+      }
+      if (stderr) {
+        parts.push("");
+        parts.push("stderr:");
+        parts.push("```");
+        parts.push(stderr);
+        parts.push("```");
+      }
+      return { answer: parts.join("\n"), usedTool: true };
+    } catch (e: any) {
+      return { answer: `执行失败：${e.message || e}`, usedTool: false };
+    }
+  }
+
+  private handleGrep(prompt: string): { answer: string; usedTool: boolean } {
+    // Try to extract keyword and optional path
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    let keyword = "";
+    let searchPath = ".";
+
+    // English: "grep KEYWORD in PATH" or "search for KEYWORD"
+    const grepMatch = prompt.match(/grep\s+(?:for\s+)?["'`]?([^"'\s]+)["'`]?(?:\s+(?:in|at|in\s+directory)\s+["'`]?([\w.\-/~]+))?/i);
+    if (grepMatch) {
+      keyword = grepMatch[1];
+      if (grepMatch[2]) searchPath = grepMatch[2];
+    }
+
+    // Chinese: try "搜索 <关键词> [在 <路径>]"
+    if (!keyword) {
+      const zhMatch = prompt.match(/(?:搜索|查找|搜索内容|找|查找内容)\s*["'`]?([^"'\s,，。]+)/);
+      if (zhMatch) keyword = zhMatch[1];
+      const pathMatch = prompt.match(/(?:在|于|从)\s*["'`]?([\w.\-/~]+)/);
+      if (pathMatch) searchPath = pathMatch[1];
+    }
+
+    // Fallback: quoted string
+    if (!keyword) {
+      const q = prompt.match(/["'`]([^"'`]{1,40})["'`]/);
+      if (q) keyword = q[1];
+    }
+
+    if (!keyword) {
+      return { answer: zh ? "请提供关键词。用法：`搜索 <关键词> [在 <路径>]`" : "Tell me what to search for. Usage: `grep <keyword> [in <path>]`", usedTool: false };
+    }
+
+    try {
+      if (!existsSync(searchPath)) return { answer: `✗ 路径不存在：${searchPath}`, usedTool: false };
+      const result = spawnSync("grep", ["-rn", "--include=*.ts", "--include=*.js", "--include=*.md", "--include=*.json", keyword, searchPath], {
+        encoding: "utf-8",
+        timeout: 10000,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      const lines = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 30);
+      if (lines.length === 0) {
+        return { answer: `在 \`${searchPath}\` 中没有找到 "${keyword}"。`, usedTool: true };
+      }
+      const out: string[] = [];
+      out.push(`找到 ${lines.length} 处匹配（关键词：\`${keyword}\`，路径：\`${searchPath}\`）：`);
+      out.push("");
+      out.push("```");
+      out.push(...lines);
+      out.push("```");
+      return { answer: out.join("\n"), usedTool: true };
+    } catch (e: any) {
+      return { answer: `搜索失败：${e.message || e}`, usedTool: false };
+    }
+  }
+
+  private handleSearchFiles(prompt: string): { answer: string; usedTool: boolean } {
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    // Extract pattern: quoted or last word-ish
+    const q = prompt.match(/["'`]([^"'`]{1,80})["'`]/) || prompt.match(/(?:find|search\s+for|search|找|查找文件)\s+["'`]?([\w.\-*]{2,80})/i);
+    const pattern = q ? q[1] : "";
+
+    if (!pattern) return { answer: zh ? "告诉我要找什么文件名。用法：`找文件 <pattern>`" : "Tell me what filename to look for.", usedTool: false };
+
+    try {
+      const result = spawnSync("find", [".", "-name", pattern, "-type", "f"], {
+        encoding: "utf-8",
+        timeout: 10000,
+      });
+      const files = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 50);
+      if (files.length === 0) return { answer: `没有找到匹配 "${pattern}" 的文件。`, usedTool: true };
+      const out: string[] = [`找到 ${files.length} 个文件：`, ""];
+      for (const f of files) out.push(`  - ${f}`);
+      return { answer: out.join("\n"), usedTool: true };
+    } catch (e: any) {
+      return { answer: `查找文件失败：${e.message || e}`, usedTool: false };
+    }
+  }
+
+  private handleGit(prompt: string): string {
+    const match = prompt.match(/git\s+(clone|pull|status|diff|log)(?:\s+["'`]?([^\s"'`]+))?/i);
+    if (!match) return "无法识别 git 命令。用法：`git clone <url>` / `git status`";
+    const cmd = match[1].toLowerCase();
+    const arg = match[2] || "";
+
+    if (cmd === "clone" && arg) {
+      try {
+        const result = spawnSync("git", ["clone", arg], { encoding: "utf-8", timeout: 60000 });
+        return `\`git clone ${arg}\`\n\`\`\`\n${(result.stdout || "") + (result.stderr || "")}\n\`\`\``;
+      } catch (e: any) {
+        return `git clone 失败：${e.message || e}`;
+      }
+    }
+    if (cmd === "status") {
+      const result = spawnSync("git", ["status"], { encoding: "utf-8", timeout: 10000 });
+      return `\`git status\`\n\`\`\`\n${result.stdout || result.stderr || "(no output)"}\n\`\`\``;
+    }
+    if (cmd === "diff") {
+      const result = spawnSync("git", ["diff"], { encoding: "utf-8", timeout: 10000 });
+      return `\`git diff\`\n\`\`\`\n${(result.stdout || "").slice(0, 3000) || result.stderr || "(clean)"}\n\`\`\``;
+    }
+    if (cmd === "pull") {
+      const result = spawnSync("git", ["pull"], { encoding: "utf-8", timeout: 30000 });
+      return `\`git pull\`\n\`\`\`\n${(result.stdout || "") + (result.stderr || "")}\n\`\`\``;
+    }
+    if (cmd === "log") {
+      const result = spawnSync("git", ["log", "--oneline", "-n", "10"], { encoding: "utf-8", timeout: 10000 });
+      return `\`git log\`\n\`\`\`\n${result.stdout || result.stderr || "(no output)"}\n\`\`\``;
+    }
+    return `支持的 git 命令：clone / pull / status / diff / log`;
+  }
+
+  private handleCodeAnalysis(): string {
+    // Scan src directory and summarize
+    try {
+      const result = spawnSync("find", ["src", "-type", "f", "-name", "*.ts"], { encoding: "utf-8", timeout: 5000 });
+      const files = (result.stdout || "").trim().split("\n").filter(Boolean);
+      if (files.length === 0) return "没有在 src/ 下找到 .ts 文件。";
+
+      let totalLines = 0;
+      const byFile: Array<{ file: string; lines: number }> = [];
+      for (const f of files.slice(0, 20)) {
+        try {
+          const content = readFileSync(f, "utf-8");
+          const lines = content.split("\n").length;
+          totalLines += lines;
+          byFile.push({ file: f, lines });
+        } catch { /* skip */ }
+      }
+      const out: string[] = [];
+      out.push(`代码分析（src/ 下 ${files.length} 个 ts 文件，共约 ${totalLines} 行）：`);
+      out.push("");
+      for (const { file, lines } of byFile.sort((a, b) => b.lines - a.lines).slice(0, 15)) {
+        out.push(`  - ${file} (${lines} 行)`);
+      }
+      return out.join("\n");
+    } catch (e: any) {
+      return `代码分析失败：${e.message || e}`;
+    }
+  }
+
+  private handleUserPreference(prompt: string): string {
+    // Store as observation in identity
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    this.identity.recordObservation(prompt.slice(0, 180));
+    if (zh) {
+      return `好的，我记下来了：「${prompt.slice(0, 80)}…」`;
+    }
+    return `Got it, I'll remember: "${prompt.slice(0, 80)}…"`;
+  }
+
+  private handleReflection(): string {
+    const stats = this.memory.stats();
+    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 5, minSimilarity: 0.01 });
+    const recent = this.memory.query({ text: "result", layer: "episodic", topK: 5, minSimilarity: 0.01 });
 
     const lines: string[] = [];
-    lines.push(`Tools: ${toolNames.join(", ")}`);
-    lines.push(`Evolved: ${unique.length} distinct capabilities (${caps.length} total in memory)`);
-
-    // Report top 5 with content preview
-    for (const c of unique.slice(0, 5)) {
-      const name = c.entry.metadata?.name || c.entry.content.slice(0, 30);
-      lines.push(`- ${name}`);
+    lines.push("## 自省");
+    lines.push(`记忆总量：${stats.total}`);
+    if (caps.length > 0) {
+      lines.push("提炼到的能力：");
+      for (const c of caps) lines.push(`  - ${c.entry.content.slice(0, 100)}`);
     }
-
-    if (caps.length > unique.length * 1.5) {
-      lines.push(`Note: ${caps.length - unique.length} duplicates detected — dedup recommended`);
+    if (recent.length > 0) {
+      lines.push("");
+      lines.push("最近的交互：");
+      for (const r of recent) lines.push(`  - ${r.entry.content.slice(0, 120)}`);
     }
-
+    lines.push("");
+    lines.push("改进方向：");
+    lines.push("  * 更多真实交互 → 更丰富的记忆/能力数据");
+    lines.push("  * 配置真实 LLM API key → 启用更智能的推理链");
     return lines.join("\n");
   }
 
-  /**
-   * 分析 goals — 报告优先级和可行性
-   */
-  private analyzeGoals(): string {
-    const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 8, minSimilarity: 0.01 });
+  private handleUnknown(prompt: string): string {
+    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    // Fuzzy hint
+    const hint = zh
+      ? `我暂时没有完全理解：「${prompt.slice(0, 60)}…」。\n\n可以试试：\n  - 读取 <文件名>  → 看文件内容\n  - 列出目录 / ls .\n  - 搜索 <关键词>\n  - run <shell 命令>\n  - 状态 / 自省\n  - 或者告诉我你想做什么，我会尽力。`
+      : `I didn't fully understand: "${prompt.slice(0, 60)}…".\n\nTry:\n  - read <file>\n  - list files in this directory\n  - grep <keyword>\n  - run <shell command>\n  - ask about my status / capabilities`;
+    return hint;
+  }
 
-    if (goals.length === 0) return "No goals identified. Exploration may not be producing signals.";
+  // ============================================================
+  // Helpers
+  // ============================================================
 
-    const lines: string[] = [];
-    lines.push(`${goals.length} knowledge gaps:`);
+  private extractFilePath(prompt: string): string | null {
+    // Strip common prefixes
+    const cleaned = prompt
+      .replace(/^(读取|查看|读|看|打开|显示|read(?:\s+the)?(?:\s+file)?|show(?:\s+me)?(?:\s+file)?|what(?:'?s| is) in)\s+/i, "")
+      .trim();
 
-    // Sort by priority if available
-    const sorted = [...goals].sort((a, b) => {
-      const pa = Number(a.entry.metadata?.priority) || 5;
-      const pb = Number(b.entry.metadata?.priority) || 5;
-      return pb - pa; // higher priority first
-    });
+    // Quoted path
+    const quoted = cleaned.match(/^["'`“”]([^"'`“”]+)["'`“”]/);
+    if (quoted) return quoted[1].trim();
 
-    for (const g of sorted.slice(0, 5)) {
-      const meta = g.entry.metadata;
-      const target = meta?.target || g.entry.content.slice(0, 40);
-      const priority = meta?.priority || "?";
-      lines.push(`- [P${priority}] ${target}`);
+    // A token that looks like a file path
+    const candidates = cleaned.split(/\s+/).filter(
+      t => /(\.[a-z0-9]{1,6}|[\/\\~]|^\.{1,2}\/)/i.test(t) || /^[\w.\-~\/]+\.[a-z0-9]{1,6}$/i.test(t)
+    );
+    if (candidates.length > 0) {
+      // Prefer an existing path
+      for (const c of candidates) {
+        if (existsSync(c)) return c;
+      }
+      return candidates[0];
     }
 
-    return lines.join("\n");
+    // Fallback: whole trimmed prompt
+    if (cleaned.length < 300 && cleaned.length > 2) {
+      const single = cleaned.split(/\s+/)[0];
+      if (existsSync(single)) return single;
+    }
+    return null;
   }
 }
