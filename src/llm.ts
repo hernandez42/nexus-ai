@@ -533,7 +533,28 @@ GOAL: optimize_kernel_selection | REASON: Need to understand Hopper vs non-Hoppe
         return `NAME: knowledge_gap_resolver | DESC: When the agent encounters unknown concepts or missing understanding, systematically research and build expertise | TOOLS: read, bash | STRATEGY: 1. Identify the unknown concept from context 2. Search documentation and source code 3. Build a minimal working example 4. Verify understanding by explaining it back | VALIDATION: echo "Knowledge gap resolved"`;
       }
 
-      return `THOUGHT: I have gathered enough information. FINAL ANSWER: This is a GPT-style transformer with configurable depth, using RMS norm and rotary embeddings.`;
+      return `I am Nexus, an autonomous reasoning agent. I can use tools, remember conversations, and evolve my capabilities over time. How can I help you?`;
+    },
+
+    async chatWithTools(messages, tools) {
+      // Mock tool calling: if there are tools available, maybe call one
+      // Otherwise just return text content.
+      const lastUserMsg = [...messages].reverse().find(m => m.role !== "assistant" && m.role !== "tool");
+      const content = lastUserMsg?.content || "";
+
+      // Simple heuristic: if the message seems like a question about files/code, try calling a file tool
+      if (tools && tools.length > 0) {
+        const fileTool = tools.find(t => t.function.name === "read_file" || t.function.name === "file_read");
+        if (content.toLowerCase().includes("read") || content.toLowerCase().includes("file")) {
+          // Simulate a tool call - but we can't actually read files in mock mode
+          // Just skip tool calling and return text answer instead
+        }
+      }
+
+      return {
+        content: `I am Nexus (mock mode). I received your message: "${content.slice(0, 120)}". I have ${tools?.length || 0} tools available but am running without a real LLM API key. Configure an OpenAI-compatible provider to enable real tool calling.`,
+        toolCalls: null,
+      };
     },
   };
 }

@@ -154,7 +154,19 @@ async function main() {
     }
   } else {
     // Single run — full cycle
-    await runFullCycle(config, log, memory, prompt);
+    try {
+      const answer = await runFullCycle(config, log, memory, prompt);
+      console.log(`\n${answer}`);
+    } catch (e: unknown) {
+      const err = e instanceof Error ? e.message : String(e);
+      console.error(`[FATAL] ${err}`);
+      memory.add({
+        layer: "episodic",
+        content: `Run failed: ${prompt.slice(0, 80)} → ${err.slice(0, 120)}`,
+        tags: ["error", "failure"],
+        metadata: { error: err },
+      });
+    }
   }
 
   clearInterval(saveInterval);
@@ -332,8 +344,6 @@ async function runFullCycle(
     metadata: { steps: result.steps.length, tools: result.toolCallsUsed },
   });
   memory.save();
-
-  console.log(`\nFinal Answer: ${result.answer.slice(0, 300)}...`);
   return result.answer;
 }
 

@@ -1,16 +1,14 @@
 /**
  * ToolLoopReasoner — pi/eve-style native tool calling loop
  *
- * Replaces AgentReasoningEngine's JSON-forced format with
- * OpenAI-native function calling (like pi Amimo's runLoop).
- *
- * Flow (matching pi Amimo):
+ * Flow:
  *   LLM receives system prompt + tools + messages
  *   → LLM decides: call tool OR reply with text
  *   → If tool_call: execute → append tool result to messages → loop
  *   → If text: return as final answer
  *
- * No JSON forcing. LLM thinks natively.
+ * Fallback: if LLM provider doesn't support chatWithTools, falls back to
+ * plain chat() — still answers but without tool calling.
  */
 
 import type { ChatMessage, ToolCall, ToolDefinition, ToolCallResult, LLMClient } from "./llm";
@@ -64,9 +62,40 @@ export interface ToolLoopResult {
   toolCallsUsed: string[];
 }
 
+/**
+ * Build a plain text message list from structured messages for providers
+ * that don't support tool calling natively.
+ */
+function buildPlainMessages(systemPrompt: string, userPrompt: string): ChatMessage[] {
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ];
+}
+
 export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResult> {
   const { systemPrompt, userPrompt, tools, llm, maxSteps = 5, onStream } = config;
 
+  const steps: ToolLoopResult["steps"] = [];
+  const toolCallsUsed: string[] = [];
+
+  // --- Fallback: no tools available OR provider doesn't support chatWithTools ---
+  const useToolCalling = tools.length > 0 && !!llm.chatWithTools;
+
+  if (!useToolCalling) {
+    // Simple path: just ask the LLM directly
+    try {
+      const answer = await llm.chat(buildPlainMessages(systemPrompt, userPrompt));
+      steps.push({ type: "answer", content: answer });
+      return { answer, steps, toolCallsUsed };
+    } catch (e: unknown) {
+      const msg = `LLM call failed: ${e instanceof Error ? e.message : String(e)}`;
+      steps.push({ type: "answer", content: msg });
+      return { answer: msg, steps, toolCallsUsed };
+    }
+  }
+
+  // --- Native tool calling path ---
   // Build OpenAI tool definitions
   const toolDefinitions: ToolDefinition[] = tools.map(t => ({
     type: "function" as const,
@@ -83,19 +112,25 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
     { role: "user", content: userPrompt },
   ];
 
-  const steps: ToolLoopResult["steps"] = [];
-  const toolCallsUsed: string[] = [];
-
   for (let step = 0; step < maxSteps; step++) {
-    // Call LLM with tools
-    if (!llm.chatWithTools) {
-      throw new Error("LLM provider does not support chatWithTools. Use OpenAI-compatible provider.");
+    let result: ToolCallResult;
+    try {
+      result = await llm.chatWithTools!(messages, toolDefinitions);
+    } catch (e: unknown) {
+      // Fallback to plain chat on tool-calling failure
+      try {
+        const fallback = await llm.chat(messages);
+        steps.push({ type: "answer", content: fallback });
+        return { answer: fallback, steps, toolCallsUsed };
+      } catch (e2: unknown) {
+        const msg = `LLM failed: ${e2 instanceof Error ? e2.message : String(e2)}`;
+        steps.push({ type: "answer", content: msg });
+        return { answer: msg, steps, toolCallsUsed };
+      }
     }
-    const result: ToolCallResult = await llm.chatWithTools(messages, toolDefinitions);
 
     if (result.toolCalls && result.toolCalls.length > 0) {
       // LLM wants to call tools — execute them
-      // Append assistant message with tool_calls to history
       const assistantMsg: ChatMessage = {
         role: "assistant",
         content: result.content || "",
@@ -107,13 +142,13 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
         const toolName = tc.function.name;
         let args: Record<string, unknown> = {};
         try {
-          args = JSON.parse(tc.function.arguments);
+          args = JSON.parse(tc.function.arguments || "{}");
         } catch {
           args = {};
         }
 
-        steps.push({ type: "tool_call", content: `[调用] ${toolName}(${JSON.stringify(args).slice(0, 100)})` });
-        if (onStream) onStream(`[调用] ${toolName}`);
+        steps.push({ type: "tool_call", content: `${toolName}(${JSON.stringify(args).slice(0, 100)})` });
+        if (onStream) onStream(`[${toolName}]`);
 
         // Execute tool
         const tool = tools.find(t => t.name === toolName);
@@ -130,7 +165,7 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
         }
 
         steps.push({ type: "tool_result", content: toolOutput.slice(0, 500) });
-        if (onStream) onStream(`[结果] ${toolOutput.slice(0, 80)}`);
+        if (onStream) onStream(toolOutput.slice(0, 120));
 
         // Append tool result to messages
         messages.push({
@@ -148,7 +183,7 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
     }
   }
 
-  // Max steps reached — return last LLM output
+  // Max steps reached — return last LLM output or truncation message
   const lastMsg = messages[messages.length - 1];
   const answer = lastMsg?.content || "Max reasoning steps reached.";
   steps.push({ type: "answer", content: answer });
