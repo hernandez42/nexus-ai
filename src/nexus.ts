@@ -97,17 +97,21 @@ async function main(): Promise<void> {
   const positional = args.filter((a) => !a.startsWith("--"));
   const prompt = positional.join(" ").trim() || "hello";
 
-  if (showHelp) {
-    console.log(HELP);
-    return;
-  }
+  // --- B2: --version / -v 必须绝对优先于其他分支（包括 default）
   if (showVersion) {
     console.log(`Nexus AI v${VERSION}`);
     return;
   }
 
+  if (showHelp) {
+    console.log(HELP);
+    return;
+  }
+
   // Workspace init
-  const workspaceDir = "./nexus-workspace";
+  // --- B3: daemon 与 offline 共用 ./nexus-workspace/memory 会互相污染。
+  // 规则：--daemon 走 ./nexus-workspace/daemon/memory；其他模式走 ./nexus-workspace/memory。
+  const workspaceDir = daemonMode ? "./nexus-workspace/daemon" : "./nexus-workspace";
   mkdirSync(workspaceDir, { recursive: true });
 
   const memory = new MemoryStore(workspaceDir + "/memory");
@@ -162,8 +166,24 @@ async function main(): Promise<void> {
 }
 
 // ============================================================
-// Default path: LocalReasoner → (maybe) LLM tool-loop
+// Default path: LocalReasoner (offline) → LLM tool-loop (online)
 // ============================================================
+//
+// B1 根治：在线模式下 LocalReasoner 不应"抢答"简单工具命令（ls / read / grep / run）
+// 策略：
+//   - offline（无 LLM_API_KEY）：全量走 LocalReasoner
+//   - online（有 LLM_API_KEY）：
+//       · 如果是 "纯元命令"（greeting / status / capabilities / reflection）→ 本地直接回答
+//       · 其他所有 query → 直送 LLM tool-loop，让模型自己决定要不要调用工具
+// ============================================================
+
+const META_INTENTS = new Set<string>([
+  "greeting",
+  "self_assessment",
+  "identity",
+  "capabilities",
+  "reflection",
+]);
 
 async function runDefault(
   memory: MemoryStore,
@@ -174,16 +194,22 @@ async function runDefault(
   const reasoner = new LocalReasoner(memory);
   const result = await reasoner.reason(prompt);
 
-  // Case 1: LocalReasoner already produced text — print it
-  // Case 2: needLLM=true → try LLM tool-loop if available
+  // --- 在线模式：只在是"纯元命令"时保留本地回答
+  if (hasLLM && !META_INTENTS.has(result.intent)) {
+    console.log(`[Nexus] routing to LLM tool-loop (provider: ${(llm as any)._debug_provider || "..."}, intent=${result.intent}) …`);
+    await runLLMToolLoop(memory, llm, prompt);
+    return;
+  }
+
+  // --- 本地推理已有答案 → 直接打印
   if (!result.needLLM && result.answer) {
     console.log(result.answer);
     persistMemory(memory, prompt, result.answer, result.toolsUsed, "local-reasoner");
     return;
   }
 
+  // --- 本地推断需要 LLM，但没 API key → 离线兜底
   if (!hasLLM) {
-    // Offline fallback: try printing any partial LocalReasoner output
     if (result.answer) console.log(result.answer);
     const lines: string[] = [];
     lines.push(`(offline mode: 设置 LLM_API_KEY 后可启用 LLM tool-loop)`);
@@ -196,12 +222,25 @@ async function runDefault(
   npx tsx src/nexus.ts "status"
   npx tsx src/nexus.ts "反省"`);
     console.log(lines.join("\n"));
-    persistMemory(memory, prompt, result.answer || "(offline fallback)", result.toolsUsed, "local-reasoner-offline");
+    persistMemory(
+      memory,
+      prompt,
+      result.answer || "(offline fallback)",
+      result.toolsUsed,
+      "local-reasoner-offline"
+    );
     return;
   }
 
-  // --- LLM tool-loop path
-  console.log(`[Nexus] routing to LLM tool-loop (provider: ${(llm as any)._debug_provider || "..."}) …`);
+  // --- 兜底：在线模式但 intent 落在 META_INTENTS 中且 needLLM（理论上不该发生）
+  await runLLMToolLoop(memory, llm, prompt);
+}
+
+async function runLLMToolLoop(
+  memory: MemoryStore,
+  llm: LLMClient,
+  prompt: string
+): Promise<void> {
   const tools = new ToolRegistry();
   const toolDefs = tools.list().map((t) => ({
     name: t.name,
@@ -213,21 +252,26 @@ async function runDefault(
   try {
     const loopResult = await runToolLoop({
       systemPrompt: `You are Nexus, an autonomous reasoning agent with persistent memory and 22 tools.
-Prioritize tools over text when answering — e.g. if the user asks "what's in this file", read_file, don't guess.
-After 1-3 tool calls, stop calling tools and synthesize a final answer in plain language.
-Respond in the user's language. Do not mention the tools used — just give the answer.`,
+When given a file path or a code question, use tools (read_file / list_dir / grep / bash) rather than guessing.
+After 1-3 tool calls, stop and synthesize a final answer in the user's language.
+Do NOT mention tools or tool names in your final answer — give the answer directly.`,
       userPrompt: prompt,
       tools: toolDefs,
       llm,
       maxSteps: 5,
     });
     console.log(loopResult.answer);
-    persistMemory(memory, prompt, loopResult.answer, loopResult.toolCallsUsed, "llm-tool-loop");
+    persistMemory(
+      memory,
+      prompt,
+      loopResult.answer,
+      loopResult.toolCallsUsed,
+      "llm-tool-loop"
+    );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[Nexus] LLM tool-loop 失败: ${msg}`);
-    if (result.answer) console.log(result.answer);
-    persistMemory(memory, prompt, result.answer || "(llm failed)", result.toolsUsed, "llm-tool-loop-failed");
+    persistMemory(memory, prompt, "(llm failed)", [], "llm-tool-loop-failed");
   }
 }
 
