@@ -17,7 +17,7 @@ export interface ToolDef {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  execute: (params: Record<string, unknown>) => Promise<string>;
+  execute: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 }
 
 /**
@@ -155,7 +155,8 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
         let toolOutput: string;
         if (tool) {
           try {
-            toolOutput = await tool.execute(args);
+            const raw = await tool.execute(args);
+            toolOutput = typeof raw === "string" ? raw : JSON.stringify(raw);
             toolCallsUsed.push(toolName);
           } catch (e: unknown) {
             toolOutput = `Error: ${e instanceof Error ? e.message : String(e)}`;

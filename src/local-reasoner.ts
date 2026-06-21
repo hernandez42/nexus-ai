@@ -1,613 +1,575 @@
 /**
- * LocalReasoner — 不依赖 LLM 的本地推理引擎
+ * LocalReasoner — 不依赖 LLM API key 的本地推理引擎
  *
- * 设计目标（对照 nanobot / eve 的推理循环）：
- *   1. 意图识别（中文 / 英文）- 规则匹配
- *   2. 从 memory 检索相关信息
- *   3. 真正调用工具（读文件、执行命令、搜索…）
- *   4. 综合出结构化的答复
+ * 设计原则（对标 nanobot / pi-mono / eve 的本地模式）：
+ *   1. 意图识别：用规则匹配中英文（可扩展）
+ *   2. 工具执行：调用 ToolRegistry（22 个工具）
+ *   3. 记忆整合：从 MemoryStore 检索并写入历史
  *
- * 关键：**即使没有 LLM API key，也能完整工作**。
- * 这意味着 read_file、bash、grep、search_files 等工具必须在本地真实调用。
+ * 返回格式
+ *   { steps, answer, intent, toolsUsed, needLLM }
+ *   — needLLM=true 表示「这个问题超出本地能力，交给上层走 tool-loop」
  */
 
-import { existsSync, readFileSync, statSync } from "fs";
 import { spawnSync } from "child_process";
 import { MemoryStore } from "./memory";
 import { ToolRegistry } from "./tools";
-import { IdentityManager } from "./identity";
 
-// ============================================================
-// Intent types
-// ============================================================
-
-type Intent =
+export type Intent =
   | "greeting"
   | "self_assessment"
   | "capabilities"
   | "memory_query"
   | "file_read"
+  | "file_write"
   | "file_list"
+  | "file_info"
   | "shell"
   | "grep"
   | "search_files"
   | "git"
-  | "code_analysis"
+  | "code_stats"
+  | "json_parse"
+  | "json_format"
+  | "http_fetch"
+  | "http_post"
   | "user_preference"
   | "reflection"
+  | "identity"
   | "unknown";
 
-// ============================================================
-// LocalReasoner
-// ============================================================
-
 export interface ReasonerResult {
-  steps: Array<{ type: string; content: string; confidence?: number }>;
+  steps: Array<{ type: string; content: string }>;
   answer: string;
   intent: Intent;
   toolsUsed: string[];
+  needLLM: boolean;
 }
 
 export class LocalReasoner {
   private memory: MemoryStore;
-  private identity: IdentityManager;
   private tools: ToolRegistry;
-  private cwd: string;
 
-  constructor(memory: MemoryStore, identity: IdentityManager, cwd: string = process.cwd()) {
+  constructor(memory: MemoryStore) {
     this.memory = memory;
-    this.identity = identity;
     this.tools = new ToolRegistry();
-    this.cwd = cwd;
   }
 
   async reason(prompt: string): Promise<ReasonerResult> {
+    const trimmed = prompt.trim();
     const steps: ReasonerResult["steps"] = [];
     const toolsUsed: string[] = [];
 
-    const intent = this.classifyIntent(prompt);
-    steps.push({ type: "intent", content: `意图：${intent}`, confidence: 0.9 });
+    const intent = this.classifyIntent(trimmed);
+    steps.push({ type: "intent", content: `${intent}` });
 
-    // Memory retrieval for context (all queries)
-    const related = this.memory.query({ text: prompt, topK: 3, minSimilarity: 0.1 });
-    if (related.length > 0) {
-      steps.push({
-        type: "memory",
-        content: `${related.length} 条相关记忆`,
-      });
-    }
-
-    // --- Dispatch to handler ---
     let answer = "";
+    let needLLM = false;
 
     switch (intent) {
       case "greeting":
-        answer = this.handleGreeting(prompt);
+        answer = this.handleGreeting(trimmed);
         break;
       case "self_assessment":
+      case "identity":
         answer = this.handleSelfAssessment();
         break;
       case "capabilities":
         answer = this.handleCapabilities();
         break;
       case "memory_query":
-        answer = this.handleMemoryQuery(prompt);
-        break;
-      case "file_read": {
-        const r = this.handleFileRead(prompt);
-        answer = r.answer;
-        if (r.usedTool) toolsUsed.push("read_file");
-        break;
-      }
-      case "file_list": {
-        const r = this.handleFileList(prompt);
-        answer = r.answer;
-        if (r.usedTool) toolsUsed.push("list_dir");
-        break;
-      }
-      case "shell": {
-        const r = this.handleShell(prompt);
-        answer = r.answer;
-        if (r.usedTool) toolsUsed.push("bash");
-        break;
-      }
-      case "grep": {
-        const r = this.handleGrep(prompt);
-        answer = r.answer;
-        if (r.usedTool) toolsUsed.push("grep");
-        break;
-      }
-      case "search_files": {
-        const r = this.handleSearchFiles(prompt);
-        answer = r.answer;
-        if (r.usedTool) toolsUsed.push("search_files");
-        break;
-      }
-      case "git":
-        answer = this.handleGit(prompt);
-        break;
-      case "code_analysis":
-        answer = this.handleCodeAnalysis();
-        break;
-      case "user_preference":
-        answer = this.handleUserPreference(prompt);
+        answer = this.handleMemoryQuery(trimmed);
         break;
       case "reflection":
         answer = this.handleReflection();
         break;
+      case "user_preference":
+        answer = this.handleUserPreference(trimmed);
+        break;
+      case "file_read": {
+        const r = await this.execTool("read_file", this.extractFileParams(trimmed));
+        answer = this.formatFileResult(r);
+        if (r?.success) toolsUsed.push("read_file");
+        break;
+      }
+      case "file_list": {
+        const r = await this.execTool("list_dir", this.extractDirParams(trimmed));
+        answer = this.formatDirResult(r);
+        if (r?.success) toolsUsed.push("list_dir");
+        break;
+      }
+      case "file_write": {
+        const r = await this.execTool("write_file", this.extractWriteParams(trimmed));
+        answer = this.formatWriteResult(r);
+        if (r?.success) toolsUsed.push("write_file");
+        break;
+      }
+      case "file_info": {
+        const r = await this.execTool("file_info", this.extractFileParams(trimmed));
+        answer = this.formatInfoResult(r);
+        if (r?.success) toolsUsed.push("file_info");
+        break;
+      }
+      case "shell": {
+        const cmd = this.extractShellCommand(trimmed);
+        const r = await this.execTool("bash", { command: cmd });
+        answer = this.formatShellResult(r);
+        if (r?.success) toolsUsed.push("bash");
+        break;
+      }
+      case "grep": {
+        const { pattern, path } = this.extractGrepParams(trimmed);
+        const r = await this.execTool("grep", { pattern, path: path || "." });
+        answer = this.formatGrepResult(r);
+        if (r?.success) toolsUsed.push("grep");
+        break;
+      }
+      case "search_files": {
+        const { pattern, path } = this.extractSearchFilesParams(trimmed);
+        const r = await this.execTool("find", { pattern, path: path || "." });
+        answer = this.formatFindResult(r);
+        if (r?.success) toolsUsed.push("find");
+        break;
+      }
+      case "git":
+        answer = this.handleGit(trimmed);
+        break;
+      case "code_stats":
+        answer = this.handleCodeStats(trimmed);
+        break;
+      case "json_parse":
+      case "json_format":
+      case "http_fetch":
+      case "http_post":
+        // 交给 LLM 处理更稳妥
+        needLLM = true;
+        answer = "";
+        break;
       case "unknown":
       default:
-        answer = this.handleUnknown(prompt);
+        const fromMemory = this.tryMemoryAnswer(trimmed);
+        if (fromMemory) {
+          answer = fromMemory;
+        } else {
+          needLLM = true;
+        }
         break;
     }
 
-    steps.push({ type: "answer", content: answer.slice(0, 200) });
-    return { steps, answer, intent, toolsUsed };
+    steps.push({ type: "answer", content: answer.slice(0, 300) });
+    return { steps, answer, intent, toolsUsed, needLLM };
   }
 
   // ============================================================
-  // Intent classification (ZH + EN)
+  // Intent classifier（中英双语 + 更鲁棒）
   // ============================================================
+  private classifyIntent(p: string): Intent {
+    const lower = p.toLowerCase().trim();
 
-  private classifyIntent(prompt: string): Intent {
-    const text = prompt.toLowerCase().trim();
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+    // --- 1. 元命令 --help / --version 由 CLI 层处理
 
-    // --- Greeting ---
-    if (/^(hi|hello|hey|greetings|yo|sup|你好|嗨|哈喽|早上好|下午好|晚上好|您好|早|问候)\b|^(你好|嗨|哈喽)/.test(text)) {
-      return "greeting";
-    }
+    // --- 2. Greeting
+    if (/^(hi|hello|hey|yo|sup|嗨|你好|早上好|下午好|晚上好|您好|早)(\s|$)/.test(lower)) return "greeting";
+    if (lower === "你好" || lower === "hello" || lower === "hi" || lower === "嗨") return "greeting";
 
-    // --- Self assessment / status ---
-    if (/(自我?评估|状态|汇报|介绍自己|自我?介绍|运行状态|你是谁|你是什么|你现在|你的情况|诊断|反省|自省)/.test(text)) return "self_assessment";
-    if (/(who are you|introduce yourself|your state|status report|self.assessment|how are you doing|about yourself)/.test(text)) return "self_assessment";
+    // --- 3. 自我评估 / 身份
+    if (/^(status|状态|汇报|自省|反思|自我评估|自我介绍|报告|你的状态|self status|tell me about yourself)$/.test(lower)) return "self_assessment";
+    if (/^(你是谁|who are you|what are you)(\s|$)/.test(lower)) return "self_assessment";
+    if (/^(反省|reflect|reflection|内省|review yourself|self review)(\s|$)/.test(lower)) return "reflection";
 
-    // --- Capabilities ---
-    if (/(你会什么|你能做什么|有什么功能|有哪些能力|能帮我做什么|你的工具)/.test(text)) return "capabilities";
-    if (/(what can you do|your capabilities|what tools|your features|what do you support)/.test(text)) return "capabilities";
+    // --- 4. 能力查询
+    if (/^(你能做什么|你会什么|有什么功能|有什么工具|有哪些能力|能帮我做什么|你的能力|capabilities|what can you do|what tools|features|你的工具)(\s|$)/.test(lower)) return "capabilities";
+    if (/(capabilities|what can you do|你的能力|有什么工具)/.test(lower) && lower.length < 80) return "capabilities";
 
-    // --- Memory query ---
-    if (/(你记得|你知道|回忆|上次|之前我们|我们之前|记忆\b|记录\b)/.test(text)) return "memory_query";
-    if (/\b(remember|memory|do you recall|what did we|last time|previous conversation)\b/i.test(text)) return "memory_query";
+    // --- 5. 文件读取（优先级最高）
+    // "read FILE" / "读取 FILE" / "cat FILE"
+    if (/^(read|读取|读|查看|显示|cat)\s+(file\s+)?['"]?([^\s'"]+)['"]?/i.test(lower)) return "file_read";
+    if (/^show\s+(me\s+)?(the\s+)?contents?\s+of\s+['"]?([^\s'"]+)/i.test(lower)) return "file_read";
+    // 纯文件名（带扩展名）
+    if (/^[\w\-./]+\.(md|ts|js|tsx|jsx|json|txt|yaml|yml|csv|log|py|go|rs|java|c|cpp|h|html|css|sh)$/i.test(p)) return "file_read";
 
-    // --- Reflection ---
-    if (/(反省|自省|反思|自我检查|总结)/.test(text)) return "reflection";
-    if (/(reflect|self.reflection|review yourself|take stock)/.test(text)) return "reflection";
+    // --- 6. 文件写入
+    if (/^(write|写|写入|write file|write to)\s+['"]?([^\s'"]+)['"]?/i.test(lower)) return "file_write";
+    if (/^write_file\s+/i.test(lower)) return "file_write";
 
-    // --- File READ ---
-    if (zh && /(读取|查看|看|显示|打开|读).*[文件]?/.test(text) && /\.[a-zA-Z0-9]{1,6}/.test(text)) return "file_read";
-    if (/^read\s+(?:the\s+)?(?:file\s+)?[\w\-.~\/]+|show\s+(?:me\s+)?(?:the\s+)?(?:file\s+)?[\w\-.~\/]+|what['’]?s\s+in\s+[\w\-.~\/]+/i.test(text)) return "file_read";
-    if (/\.(json|ts|js|md|txt|yml|yaml|toml|ini|csv|log|py|go|rs|java|c|cpp|h|html|css)$/i.test(text) && text.length > 3) return "file_read";
+    // --- 7. 列出目录
+    if (/^(ls|list|列出|列|dir|有什么文件|显示文件)(\s|$)/i.test(lower)) return "file_list";
+    if (/^list\s+(files?\s+in\s+|the\s+)?(dir(ector)?y\s+)?['"]?([\w\-./]+)/i.test(lower)) return "file_list";
+    if (/^(ls|list)\s+['"]?([\w\-./]+)/i.test(lower)) return "file_list";
 
-    // --- File LIST ---
-    if (/(列出目录|列出|有什么文件|目录|列出文件|ls\b|显示目录)/.test(text)) return "file_list";
-    if (/(list (?:files|directory|dir)|ls\b|what files|what is in (?:the )?(?:current )?(?:directory|folder)|show me (?:files|directory))/i.test(text)) return "file_list";
+    // --- 8. 文件信息
+    if (/^(file info|info about|stat|文件信息|文件大小|file size)\s+['"]?([^\s'"]+)/i.test(lower)) return "file_info";
 
-    // --- GREP / content search ---
-    if (zh && /(搜索|查找|检索|搜|找).*(内容|代码|字符串|文字|在)?/.test(text)) return "grep";
-    if (/(grep\b|search\s+for|search\s+code|find\s+(?:the\s+)?(?:string|content)|look\s+for\s+(?:the\s+)?string|contain\s+text)/i.test(text)) return "grep";
-    if (/^grep\b/i.test(text)) return "grep";
-    if (/^(查找|搜索|搜)\s+/i.test(text)) return "grep";
+    // --- 9. grep / 内容搜索
+    if (/^(grep|search for|搜索|查找内容|在.*?中搜索|查找)\s+/i.test(lower)) return "grep";
+    if (/^grep\s+['"]?([^\s'"]+)['"]?/i.test(lower)) return "grep";
 
-    // --- Search FILES by name ---
-    if (/(查找文件|找文件|搜索文件|file\s+search|find.*file|locate\s)/i.test(text)) return "search_files";
+    // --- 10. 搜索文件名
+    if (/^(find\s+files?|search\s+files?|find\s+files?\s+named|查找文件|搜文件|find)\s+/i.test(lower)) return "search_files";
+    if (/^find\s+['"]?([^\s'"]+)['"]?$/i.test(lower)) return "search_files";
 
-    // --- Shell / Bash ---
-    if (/^(运行|执行|跑|shell\s*[:：]?|bash\s*[:：]?|命令[:：]?)\s*/.test(text)) return "shell";
-    if (/^(run|execute|bash:|shell:)\s+/i.test(text)) return "shell";
-    if (/(运行命令|执行命令|run the command|execute)/i.test(text)) return "shell";
+    // --- 11. Shell / 命令
+    if (/^(run|execute|bash[:：]?\s*|shell[:：]?\s*|运行|执行|跑|命令[:：])\s+/i.test(lower)) return "shell";
+    // 典型 shell 命令开头（不作为 grep 等的首匹配）
+    const shellLike = /^(echo|pwd|cat\s|head\s|tail\s|wc\s|ls\s+-|date|uname|whoami|which|npm\s|node\s|tsx\s|npx\s|curl\s|wget\s)/i;
+    if (shellLike.test(lower)) return "shell";
 
-    // --- Git ---
-    if (/(git\s+(clone|pull|status|diff|log)|克隆\s*仓库|git\s*[:：]?)/i.test(text)) return "git";
+    // --- 12. Git
+    if (/^(git\s+(status|diff|log|clone|pull|push)|git[:：]|git操作)/i.test(lower)) return "git";
 
-    // --- Code analysis ---
-    if (/(代码分析|分析代码|代码结构|review code|analyze code)/i.test(text)) return "code_analysis";
+    // --- 13. 代码统计
+    if (/^(code stats|代码统计|line count|行数|统计代码|analyze code|代码分析)/i.test(lower)) return "code_stats";
 
-    // --- User preference ---
-    if (zh && /(我(喜欢|偏好|想要)|你应该|记得我|我的习惯)/.test(text)) return "user_preference";
-    if (/(i prefer|i like|i want you to|remember that i|my habit)/i.test(text)) return "user_preference";
+    // --- 14. JSON
+    if (/^(parse json|json parse|解析 json)/i.test(lower)) return "json_parse";
+    if (/^(format json|json format|格式化 json)/i.test(lower)) return "json_format";
 
+    // --- 15. HTTP
+    if (/^(fetch|get|curl|请求|访问)\s+(https?:\/\/|\/)/i.test(lower)) return "http_fetch";
+    if (/^http post\s+/i.test(lower)) return "http_post";
+
+    // --- 16. 记忆查询
+    if (/^(remember|memory recall|回忆|记得|你的记忆|历史记录|what do you remember)(\s|$)/i.test(lower)) return "memory_query";
+    if (lower.includes("记忆") || lower.includes("remember") || lower.includes("recall")) return "memory_query";
+
+    // --- 17. 用户偏好
+    if (lower.includes("i prefer") || lower.includes("我喜欢") || lower.includes("remember that i") || lower.includes("请记住")) return "user_preference";
+
+    // --- default：交给 LLM
     return "unknown";
   }
 
   // ============================================================
-  // Handlers
+  // Tool execution（统一通过 ToolRegistry）
   // ============================================================
+  private async execTool(
+    name: string,
+    params: Record<string, unknown>
+  ): Promise<{ success: boolean; raw: Record<string, unknown> | null; error?: string }> {
+    const tool = this.tools.get(name);
+    if (!tool) return { success: false, raw: null, error: `Tool not found: ${name}` };
+    try {
+      const raw = await tool.execute(params);
+      if (raw.error) return { success: false, raw, error: String(raw.error) };
+      return { success: true, raw };
+    } catch (e: unknown) {
+      return {
+        success: false,
+        raw: null,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
 
-  private handleGreeting(prompt: string): string {
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
+  // --- Handlers：纯文本（不需要工具）
+  private handleGreeting(p: string): string {
+    const zh = /[\u4e00-\u9fa5]/.test(p);
     const stats = this.memory.stats();
     if (zh) {
-      return `你好。我是 ${this.identity.get().name} — ${this.identity.get().role}。\n目前有 ${stats.total} 条记忆（${stats.episodic} 事件 / ${stats.semantic} 语义 / ${stats.procedural} 能力）。\n你想聊什么？`;
+      return (
+        `你好 👋 我是 Nexus。\n` +
+        `当前有 ${stats.total} 条记忆（${stats.episodic} 事件 / ${stats.semantic} 语义 / ${stats.procedural} 能力）。\n` +
+        `可以帮你：读取文件 / 列出目录 / grep 搜索 / 运行 shell 命令 / 代码统计。`
+      );
     }
-    return `Hi. I'm ${this.identity.get().name} — ${this.identity.get().role}.\nI have ${stats.total} memory entries (${stats.episodic} episodic / ${stats.semantic} semantic / ${stats.procedural} procedural).\nWhat would you like to explore?`;
+    return (
+      `Hi 👋 I'm Nexus.\n` +
+      `Memory: ${stats.total} entries (${stats.episodic} episodic / ${stats.semantic} semantic / ${stats.procedural} procedural).\n` +
+      `Try: "read README.md" · "list files in src" · "grep Nexus README.md" · "run date" · "what can you do?"`
+    );
   }
 
   private handleSelfAssessment(): string {
     const stats = this.memory.stats();
-    const id = this.identity.summary();
-    const learned = this.identity.get().learnedFromUser;
-
-    const lines: string[] = [];
-    lines.push(id);
-    lines.push("");
-    lines.push("---");
-    lines.push(`记忆统计：${stats.total} 条`);
-    lines.push(`  * 事件（episodic）：${stats.episodic}`);
-    lines.push(`  * 语义（semantic）：${stats.semantic}`);
-    lines.push(`  * 能力（procedural）：${stats.procedural}`);
-
-    // Recent memories
-    const recent = this.memory.query({ text: "recent", layer: "episodic", topK: 5, minSimilarity: 0.0 }).slice(0, 5);
-    if (recent.length > 0) {
-      lines.push("");
-      lines.push("最近的 5 条记忆：");
-      for (const m of recent) {
-        lines.push(`  - [${m.entry.layer}] ${m.entry.content.slice(0, 120)}`);
-      }
-    }
-
-    if (learned.length > 0) {
-      lines.push("");
-      lines.push("关于你学到的：");
-      for (const l of learned.slice(0, 5)) lines.push(`  - ${l}`);
-    }
-
-    lines.push("");
-    lines.push("---");
-    lines.push("你可以直接问我文件、代码、shell 命令等问题 — 即使没有 LLM API key，我也能用本地工具帮你做实际工作。");
-
-    return lines.join("\n");
+    const toolNames = this.tools.names();
+    return [
+      `# Nexus · 状态报告`,
+      ``,
+      `## 记忆`,
+      `- 总数: ${stats.total}`,
+      `- 事件 episodic: ${stats.episodic}`,
+      `- 语义 semantic: ${stats.semantic}`,
+      `- 能力 procedural: ${stats.procedural}`,
+      ``,
+      `## 可用工具（${toolNames.length}）`,
+      `- 文件系统: read_file · write_file · list_dir · file_info`,
+      `- Shell: bash · grep · find · env`,
+      `- Code: parse_json · format_json · diff · count_lines · self_modify · self_read`,
+      `- Memory: memory_query · memory_write · dreamer_tick · temporal_index`,
+      `- Network: fetch_url · http_post`,
+      `- Utility: sleep · timestamp`,
+      ``,
+      `## 运行模式`,
+      `- 离线（offline）: 本地规则 + ToolRegistry，无需 API key`,
+      `- 在线（online）: 需要 LLM_API_KEY，启用原生 tool calling + ReAct 循环`,
+      ``,
+      `## 下一步`,
+      `- "list files in src" → 仓库结构`,
+      `- "grep TODO src" → 待办`,
+      `- "run wc -l src/*.ts" → 代码规模`,
+    ].join("\n");
   }
 
   private handleCapabilities(): string {
-    const caps = this.identity.get().capabilities;
-    const lines = ["我可以：", ""];
-    for (const c of caps) lines.push(`  - ${c}`);
-    lines.push("");
-    lines.push("常用命令举例：");
-    lines.push("  - 读取 <路径>          → 读取文件内容");
-    lines.push("  - 列出目录                  → 列出当前目录文件");
-    lines.push("  - grep <关键词> [路径]  → 搜索内容");
-    lines.push("  - run <shell 命令>          → 执行 shell 命令");
-    lines.push("  - 状态 / 自我评估           → 查看我的状态");
+    const toolNames = this.tools.names();
+    return [
+      `我能做这些事：`,
+      ``,
+      `1. 文件读写 & 目录遍历（read_file / write_file / list_dir / file_info）`,
+      `2. Shell 命令（bash / grep / find / env）`,
+      `3. JSON 解析与格式化（parse_json / format_json）`,
+      `4. Git 基础操作（git status / diff / log / clone / pull）`,
+      `5. HTTP GET / POST（fetch_url / http_post）`,
+      `6. 持久化记忆（三层 memory）`,
+      `7. 自我评估 & 自省（"状态" / "反省"）`,
+      `8. 有 LLM API key 时可启用 LLM tool-loop（原生 function calling）`,
+      ``,
+      `当前已注册 ${toolNames.length} 个工具：`,
+      toolNames.map((n) => `  · ${n}`).join("\n"),
+    ].join("\n");
+  }
+
+  private handleMemoryQuery(p: string): string {
+    const results = this.memory.query({ text: p, topK: 5, minSimilarity: 0.1 });
+    if (results.length === 0) return `没有找到与 "${p}" 相关的记忆。`;
+    const lines = [`找到 ${results.length} 条相关记忆：`, ""];
+    for (const r of results) {
+      const ts = (r.entry as any).createdAt ? new Date((r.entry as any).createdAt).toLocaleString() : "";
+      lines.push(`  [${r.entry.layer}] ${r.entry.content.slice(0, 120)}  (相似度 ${r.similarity.toFixed(2)}${ts ? ", " + ts : ""})`);
+    }
     return lines.join("\n");
-  }
-
-  private handleMemoryQuery(prompt: string): string {
-    const memories = this.memory.query({ text: prompt, topK: 8, minSimilarity: 0.05 });
-    if (memories.length === 0) {
-      return "没有找到相关记忆。";
-    }
-    const lines = [`找到 ${memories.length} 条相关记忆：`, ""];
-    for (const m of memories) {
-      const ts = m.entry.createdAt ? new Date(m.entry.createdAt).toLocaleString() : "";
-      lines.push(`  [${m.entry.layer}] ${m.entry.content.slice(0, 140)}  (相似度=${m.similarity.toFixed(2)}${ts ? ", " + ts : ""})`);
-    }
-    return lines.join("\n");
-  }
-
-  private handleFileRead(prompt: string): { answer: string; usedTool: boolean } {
-    // Extract a file path from the prompt
-    const path = this.extractFilePath(prompt);
-    if (!path) {
-      return { answer: "没有识别出文件路径。你可以直接给我文件名，例如：`读取 package.json`。", usedTool: false };
-    }
-
-    // Use tools.ts read_file for consistency
-    const result = this.tools.get("read_file")?.execute({ path }) as any;
-    const resolved = Promise.resolve(result);
-
-    // Handle sync/async — actually ToolRegistry execute is async so we need to await,
-    // but for simplicity we use synchronous read here too.
-    // Let's use sync fallback.
-    try {
-      if (!existsSync(path)) return { answer: `✗ 文件不存在：${path}`, usedTool: false };
-      const st = statSync(path);
-      if (st.isDirectory()) return { answer: `✗ 路径是目录：${path}。用「列出目录」可以查看里面的文件。`, usedTool: false };
-      const content = readFileSync(path, "utf-8");
-      const preview = content.slice(0, 2000);
-      const lines: string[] = [];
-      lines.push(`文件：${path}`);
-      lines.push(`大小：${content.length} 字符（显示前 ${preview.length}）`);
-      lines.push("");
-      lines.push("```");
-      lines.push(preview);
-      lines.push("```");
-      return { answer: lines.join("\n"), usedTool: true };
-    } catch (e: any) {
-      return { answer: `读取失败：${e.message || e}`, usedTool: false };
-    }
-  }
-
-  private handleFileList(prompt: string): { answer: string; usedTool: boolean } {
-    // Try to extract a directory path
-    let dir = ".";
-    const match = prompt.match(/([./~\w\-]+\/[\w\-.\/]*|(?:current|this|the)\s*(?:directory|folder|目录))/i);
-    if (match) {
-      dir = match[1].replace(/^(current|this|the)\s*(?:directory|folder|目录)$/i, ".");
-    }
-
-    try {
-      if (!existsSync(dir)) return { answer: `✗ 目录不存在：${dir}`, usedTool: false };
-      const st = statSync(dir);
-      if (!st.isDirectory()) return { answer: `✗ 不是目录：${dir}`, usedTool: false };
-
-      const result = spawnSync("ls", ["-lah", dir], { encoding: "utf-8", timeout: 5000 });
-      const output = (result.stdout || "").slice(0, 2500);
-      return {
-        answer: `目录：${dir}\n\`\`\`\n${output || "(空)"}\n\`\`\``,
-        usedTool: true,
-      };
-    } catch (e: any) {
-      return { answer: `列出目录失败：${e.message || e}`, usedTool: false };
-    }
-  }
-
-  private handleShell(prompt: string): { answer: string; usedTool: boolean } {
-    // Strip leading trigger word
-    let cmd = prompt
-      .replace(/^(运行|执行|跑|run\s+|execute\s+|bash[:：]?\s*|shell[:：]?\s*|命令[:：]?\s*)/i, "")
-      .trim();
-
-    if (!cmd) return { answer: "请告诉我要运行什么命令，例如：`run ls -la`", usedTool: false };
-
-    // Security check
-    const dangerous = [
-      /rm\s+-rf\s+(\/\s*|~|\*)$/,
-      /\bsudo\b/,
-      /\bmkfs\b/,
-      /\bdd\b.*of=\/dev/,
-      />\s*\/dev\/sd/,
-    ];
-    for (const re of dangerous) {
-      if (re.test(cmd)) return { answer: `✗ 这个命令太危险了，我不会执行：\`${cmd}\``, usedTool: false };
-    }
-
-    try {
-      const result = spawnSync("sh", ["-c", cmd], {
-        encoding: "utf-8",
-        timeout: 15000,
-        maxBuffer: 5 * 1024 * 1024,
-      });
-      const stdout = (result.stdout || "").slice(0, 3000);
-      const stderr = (result.stderr || "").slice(0, 1000);
-      const parts: string[] = [];
-      parts.push(`命令：\`${cmd}\``);
-      if (result.status !== 0) parts.push(`退出码：${result.status}`);
-      if (stdout) {
-        parts.push("");
-        parts.push("stdout:");
-        parts.push("```");
-        parts.push(stdout);
-        parts.push("```");
-      }
-      if (stderr) {
-        parts.push("");
-        parts.push("stderr:");
-        parts.push("```");
-        parts.push(stderr);
-        parts.push("```");
-      }
-      return { answer: parts.join("\n"), usedTool: true };
-    } catch (e: any) {
-      return { answer: `执行失败：${e.message || e}`, usedTool: false };
-    }
-  }
-
-  private handleGrep(prompt: string): { answer: string; usedTool: boolean } {
-    // Try to extract keyword and optional path
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
-    let keyword = "";
-    let searchPath = ".";
-
-    // English: "grep KEYWORD in PATH" or "search for KEYWORD"
-    const grepMatch = prompt.match(/grep\s+(?:for\s+)?["'`]?([^"'\s]+)["'`]?(?:\s+(?:in|at|in\s+directory)\s+["'`]?([\w.\-/~]+))?/i);
-    if (grepMatch) {
-      keyword = grepMatch[1];
-      if (grepMatch[2]) searchPath = grepMatch[2];
-    }
-
-    // Chinese: try "搜索 <关键词> [在 <路径>]"
-    if (!keyword) {
-      const zhMatch = prompt.match(/(?:搜索|查找|搜索内容|找|查找内容)\s*["'`]?([^"'\s,，。]+)/);
-      if (zhMatch) keyword = zhMatch[1];
-      const pathMatch = prompt.match(/(?:在|于|从)\s*["'`]?([\w.\-/~]+)/);
-      if (pathMatch) searchPath = pathMatch[1];
-    }
-
-    // Fallback: quoted string
-    if (!keyword) {
-      const q = prompt.match(/["'`]([^"'`]{1,40})["'`]/);
-      if (q) keyword = q[1];
-    }
-
-    if (!keyword) {
-      return { answer: zh ? "请提供关键词。用法：`搜索 <关键词> [在 <路径>]`" : "Tell me what to search for. Usage: `grep <keyword> [in <path>]`", usedTool: false };
-    }
-
-    try {
-      if (!existsSync(searchPath)) return { answer: `✗ 路径不存在：${searchPath}`, usedTool: false };
-      const result = spawnSync("grep", ["-rn", "--include=*.ts", "--include=*.js", "--include=*.md", "--include=*.json", keyword, searchPath], {
-        encoding: "utf-8",
-        timeout: 10000,
-        maxBuffer: 2 * 1024 * 1024,
-      });
-      const lines = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 30);
-      if (lines.length === 0) {
-        return { answer: `在 \`${searchPath}\` 中没有找到 "${keyword}"。`, usedTool: true };
-      }
-      const out: string[] = [];
-      out.push(`找到 ${lines.length} 处匹配（关键词：\`${keyword}\`，路径：\`${searchPath}\`）：`);
-      out.push("");
-      out.push("```");
-      out.push(...lines);
-      out.push("```");
-      return { answer: out.join("\n"), usedTool: true };
-    } catch (e: any) {
-      return { answer: `搜索失败：${e.message || e}`, usedTool: false };
-    }
-  }
-
-  private handleSearchFiles(prompt: string): { answer: string; usedTool: boolean } {
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
-    // Extract pattern: quoted or last word-ish
-    const q = prompt.match(/["'`]([^"'`]{1,80})["'`]/) || prompt.match(/(?:find|search\s+for|search|找|查找文件)\s+["'`]?([\w.\-*]{2,80})/i);
-    const pattern = q ? q[1] : "";
-
-    if (!pattern) return { answer: zh ? "告诉我要找什么文件名。用法：`找文件 <pattern>`" : "Tell me what filename to look for.", usedTool: false };
-
-    try {
-      const result = spawnSync("find", [".", "-name", pattern, "-type", "f"], {
-        encoding: "utf-8",
-        timeout: 10000,
-      });
-      const files = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 50);
-      if (files.length === 0) return { answer: `没有找到匹配 "${pattern}" 的文件。`, usedTool: true };
-      const out: string[] = [`找到 ${files.length} 个文件：`, ""];
-      for (const f of files) out.push(`  - ${f}`);
-      return { answer: out.join("\n"), usedTool: true };
-    } catch (e: any) {
-      return { answer: `查找文件失败：${e.message || e}`, usedTool: false };
-    }
-  }
-
-  private handleGit(prompt: string): string {
-    const match = prompt.match(/git\s+(clone|pull|status|diff|log)(?:\s+["'`]?([^\s"'`]+))?/i);
-    if (!match) return "无法识别 git 命令。用法：`git clone <url>` / `git status`";
-    const cmd = match[1].toLowerCase();
-    const arg = match[2] || "";
-
-    if (cmd === "clone" && arg) {
-      try {
-        const result = spawnSync("git", ["clone", arg], { encoding: "utf-8", timeout: 60000 });
-        return `\`git clone ${arg}\`\n\`\`\`\n${(result.stdout || "") + (result.stderr || "")}\n\`\`\``;
-      } catch (e: any) {
-        return `git clone 失败：${e.message || e}`;
-      }
-    }
-    if (cmd === "status") {
-      const result = spawnSync("git", ["status"], { encoding: "utf-8", timeout: 10000 });
-      return `\`git status\`\n\`\`\`\n${result.stdout || result.stderr || "(no output)"}\n\`\`\``;
-    }
-    if (cmd === "diff") {
-      const result = spawnSync("git", ["diff"], { encoding: "utf-8", timeout: 10000 });
-      return `\`git diff\`\n\`\`\`\n${(result.stdout || "").slice(0, 3000) || result.stderr || "(clean)"}\n\`\`\``;
-    }
-    if (cmd === "pull") {
-      const result = spawnSync("git", ["pull"], { encoding: "utf-8", timeout: 30000 });
-      return `\`git pull\`\n\`\`\`\n${(result.stdout || "") + (result.stderr || "")}\n\`\`\``;
-    }
-    if (cmd === "log") {
-      const result = spawnSync("git", ["log", "--oneline", "-n", "10"], { encoding: "utf-8", timeout: 10000 });
-      return `\`git log\`\n\`\`\`\n${result.stdout || result.stderr || "(no output)"}\n\`\`\``;
-    }
-    return `支持的 git 命令：clone / pull / status / diff / log`;
-  }
-
-  private handleCodeAnalysis(): string {
-    // Scan src directory and summarize
-    try {
-      const result = spawnSync("find", ["src", "-type", "f", "-name", "*.ts"], { encoding: "utf-8", timeout: 5000 });
-      const files = (result.stdout || "").trim().split("\n").filter(Boolean);
-      if (files.length === 0) return "没有在 src/ 下找到 .ts 文件。";
-
-      let totalLines = 0;
-      const byFile: Array<{ file: string; lines: number }> = [];
-      for (const f of files.slice(0, 20)) {
-        try {
-          const content = readFileSync(f, "utf-8");
-          const lines = content.split("\n").length;
-          totalLines += lines;
-          byFile.push({ file: f, lines });
-        } catch { /* skip */ }
-      }
-      const out: string[] = [];
-      out.push(`代码分析（src/ 下 ${files.length} 个 ts 文件，共约 ${totalLines} 行）：`);
-      out.push("");
-      for (const { file, lines } of byFile.sort((a, b) => b.lines - a.lines).slice(0, 15)) {
-        out.push(`  - ${file} (${lines} 行)`);
-      }
-      return out.join("\n");
-    } catch (e: any) {
-      return `代码分析失败：${e.message || e}`;
-    }
-  }
-
-  private handleUserPreference(prompt: string): string {
-    // Store as observation in identity
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
-    this.identity.recordObservation(prompt.slice(0, 180));
-    if (zh) {
-      return `好的，我记下来了：「${prompt.slice(0, 80)}…」`;
-    }
-    return `Got it, I'll remember: "${prompt.slice(0, 80)}…"`;
   }
 
   private handleReflection(): string {
     const stats = this.memory.stats();
-    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 5, minSimilarity: 0.01 });
-    const recent = this.memory.query({ text: "result", layer: "episodic", topK: 5, minSimilarity: 0.01 });
-
     const lines: string[] = [];
-    lines.push("## 自省");
-    lines.push(`记忆总量：${stats.total}`);
-    if (caps.length > 0) {
-      lines.push("提炼到的能力：");
-      for (const c of caps) lines.push(`  - ${c.entry.content.slice(0, 100)}`);
+    lines.push(`# Nexus · 自省`);
+    lines.push(``);
+    lines.push(`- 记忆条目: ${stats.total}`);
+    lines.push(`- 工具总数: ${this.tools.names().length}`);
+    const recent = this.memory.query({ text: "run", topK: 3, minSimilarity: 0 }).slice(0, 3);
+    if (recent.length) {
+      lines.push(`- 最近记忆 (前 3 条):`);
+      for (const m of recent) lines.push(`    · ${m.entry.content.slice(0, 100)}`);
     }
-    if (recent.length > 0) {
-      lines.push("");
-      lines.push("最近的交互：");
-      for (const r of recent) lines.push(`  - ${r.entry.content.slice(0, 120)}`);
-    }
-    lines.push("");
-    lines.push("改进方向：");
-    lines.push("  * 更多真实交互 → 更丰富的记忆/能力数据");
-    lines.push("  * 配置真实 LLM API key → 启用更智能的推理链");
+    lines.push(``);
+    lines.push(`## 下一步`);
+    lines.push(`- 配置 LLM_API_KEY → 启用原生 tool calling`);
+    lines.push(`- "grep TODO src" → 找到代码中的 TODO`);
+    lines.push(`- "read src/nexus.ts" → 主入口`);
     return lines.join("\n");
   }
 
-  private handleUnknown(prompt: string): string {
-    const zh = /[\u4e00-\u9fa5]/.test(prompt);
-    // Fuzzy hint
-    const hint = zh
-      ? `我暂时没有完全理解：「${prompt.slice(0, 60)}…」。\n\n可以试试：\n  - 读取 <文件名>  → 看文件内容\n  - 列出目录 / ls .\n  - 搜索 <关键词>\n  - run <shell 命令>\n  - 状态 / 自省\n  - 或者告诉我你想做什么，我会尽力。`
-      : `I didn't fully understand: "${prompt.slice(0, 60)}…".\n\nTry:\n  - read <file>\n  - list files in this directory\n  - grep <keyword>\n  - run <shell command>\n  - ask about my status / capabilities`;
-    return hint;
+  private handleUserPreference(p: string): string {
+    this.memory.add({
+      layer: "semantic",
+      content: `user_preference: ${p.slice(0, 200)}`,
+      tags: ["user_preference"],
+      metadata: { source: "local-reasoner" },
+    });
+    return `已记录：「${p.slice(0, 120)}…」（存进 semantic memory）`;
   }
 
   // ============================================================
-  // Helpers
+  // 参数提取
   // ============================================================
+  private extractFileParams(p: string): Record<string, unknown> {
+    const tokens = p.trim().split(/\s+/);
+    const last = tokens[tokens.length - 1] || "";
+    let path = last.replace(/[。？！!?.,;:]$/, "");
+    if (!/[./]/.test(path)) {
+      const match = p.match(/[\w\-./]+\.[a-z0-9]{2,6}/i);
+      if (match) path = match[0];
+    }
+    return { path };
+  }
 
-  private extractFilePath(prompt: string): string | null {
-    // Strip common prefixes
-    const cleaned = prompt
-      .replace(/^(读取|查看|读|看|打开|显示|read(?:\s+the)?(?:\s+file)?|show(?:\s+me)?(?:\s+file)?|what(?:'?s| is) in)\s+/i, "")
+  private extractDirParams(p: string): Record<string, unknown> {
+    // "list <path>" / "ls <path>" / "list files in <path>"
+    const lower = p.toLowerCase();
+    const tokens = p.trim().split(/\s+/);
+
+    const inIdx = lower.indexOf(" in ");
+    if (inIdx >= 0) {
+      const rest = p.slice(inIdx + 4).trim();
+      if (rest) return { path: rest.split(/\s+/)[0] };
+    }
+    const chineseIdx = lower.indexOf(" 在 ");
+    if (chineseIdx >= 0) {
+      const rest = p.slice(chineseIdx + 3).trim();
+      if (rest) return { path: rest.split(/\s+/)[0] };
+    }
+    // 末尾 token 如果是目录路径
+    const last = tokens[tokens.length - 1];
+    if (last && (/^\./.test(last) || /[\\/]$/.test(last) || /^(src|docs|example|tests|lib|bin|dist|build)$/.test(last))) {
+      return { path: last };
+    }
+    return { path: "." };
+  }
+
+  private extractWriteParams(p: string): Record<string, unknown> {
+    const rest = p.replace(/^(write\s+file\s+|write\s+|写入\s+)/i, "");
+    const spaceIdx = rest.search(/\s/);
+    if (spaceIdx < 0) return { path: rest, content: "" };
+    const path = rest.slice(0, spaceIdx);
+    const content = rest.slice(spaceIdx + 1);
+    return { path, content };
+  }
+
+  private extractShellCommand(p: string): string {
+    return p
+      .replace(/^(run\s+|execute\s+|bash[:：]?\s*|shell[:：]?\s*|运行\s+|执行\s+|跑\s+|命令[:：]?\s*)/i, "")
       .trim();
+  }
 
-    // Quoted path
-    const quoted = cleaned.match(/^["'`“”]([^"'`“”]+)["'`“”]/);
-    if (quoted) return quoted[1].trim();
+  private extractGrepParams(p: string): { pattern: string; path: string | null } {
+    const t = p.trim();
+    const rest = t.replace(/^(grep\s+(for\s+)?|search\s+for\s+|搜索\s+|查找内容\s+|查找\s+)/i, "");
+    const inMatch = rest.match(/^(.*?)\s+(?:in|在)\s+(\S+)$/i);
+    if (inMatch) {
+      return {
+        pattern: inMatch[1].trim().replace(/^['"]|['"]$/g, ""),
+        path: inMatch[2],
+      };
+    }
+    const tokens = rest.split(/\s+/);
+    const pattern = tokens[0].replace(/^['"]|['"]$/g, "");
+    const last = tokens[tokens.length - 1];
+    if (tokens.length > 1 && /^(\.|src|\/|\.\.|tests|docs|example|\w+\.\w+)/.test(last)) {
+      return { pattern, path: last };
+    }
+    return { pattern, path: null };
+  }
 
-    // A token that looks like a file path
-    const candidates = cleaned.split(/\s+/).filter(
-      t => /(\.[a-z0-9]{1,6}|[\/\\~]|^\.{1,2}\/)/i.test(t) || /^[\w.\-~\/]+\.[a-z0-9]{1,6}$/i.test(t)
-    );
-    if (candidates.length > 0) {
-      // Prefer an existing path
-      for (const c of candidates) {
-        if (existsSync(c)) return c;
+  private extractSearchFilesParams(p: string): { pattern: string; path: string } {
+    const t = p.trim();
+    const m = t.match(/(?:find(?:\s+files?)?(?:\s+named)?|search(?:\s+for)?(?:\s+files?)?(?:\s+named)?|查找文件?)\s+['"]?([^\s'"]+)['"]?(?:\s+in\s+['"]?([^\s'"]+))?/i);
+    if (m) return { pattern: m[1], path: m[2] || "." };
+    return { pattern: "*", path: "." };
+  }
+
+  // ============================================================
+  // 结果格式化
+  // ============================================================
+  private formatFileResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "读取失败"}`;
+    const { content, totalLength } = r.raw || {};
+    const len = String(content ?? "").length;
+    const head = totalLength ? `文件内容（${len} / ${totalLength} 字符）` : `文件内容（${len} 字符）`;
+    return `\`${head}\`\n\n\`\`\`\n${String(content ?? "")}\n\`\`\``;
+  }
+
+  private formatDirResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "列出目录失败"}`;
+    const { files, dirs } = r.raw || {};
+    const f = Array.isArray(files) ? (files as string[]) : [];
+    const d = Array.isArray(dirs) ? (dirs as string[]) : [];
+    const lines: string[] = [`目录内容（${f.length} 个文件 / ${d.length} 个子目录）：`, ""];
+    if (d.length) lines.push(`[dirs]  ${d.slice(0, 50).join("  ")}`);
+    if (f.length) lines.push(`[files] ${f.slice(0, 100).join("\n       ")}`);
+    return lines.join("\n");
+  }
+
+  private formatWriteResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "写入失败"}`;
+    const { bytes, path } = r.raw || {};
+    return `✓ 已写入 ${path}（${bytes} 字节）`;
+  }
+
+  private formatInfoResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "无法读取文件信息"}`;
+    return JSON.stringify(r.raw, null, 2);
+  }
+
+  private formatShellResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "命令执行失败"}`;
+    const { output, exitCode, stderr } = (r.raw || {}) as Record<string, unknown>;
+    const parts: string[] = [];
+    if (exitCode != null) parts.push(`exit: ${String(exitCode)}`);
+    if (output != null && String(output).trim()) {
+      parts.push("stdout:");
+      parts.push("```");
+      parts.push(String(output).slice(0, 4000));
+      parts.push("```");
+    }
+    if (stderr != null && String(stderr).trim()) {
+      parts.push("stderr:");
+      parts.push("```");
+      parts.push(String(stderr).slice(0, 1500));
+      parts.push("```");
+    }
+    return parts.join("\n");
+  }
+
+  private formatGrepResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "搜索失败"}`;
+    const matches = (r.raw as any)?.matches as string[] | undefined;
+    const clean = Array.isArray(matches) ? matches.filter(Boolean) : [];
+    if (clean.length === 0) return `没有找到匹配。`;
+    const lines = [`找到 ${clean.length} 处匹配：`, "```"];
+    for (const m of clean.slice(0, 50)) lines.push(String(m).slice(0, 200));
+    lines.push("```");
+    return lines.join("\n");
+  }
+
+  private formatFindResult(r: { success: boolean; raw: Record<string, unknown> | null; error?: string }): string {
+    if (!r.success) return `✗ ${r.error || "搜索文件失败"}`;
+    const files = (r.raw as any)?.files as string[] | undefined;
+    const clean = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (clean.length === 0) return `没有找到匹配的文件。`;
+    const lines = [`找到 ${clean.length} 个文件：`, ""];
+    for (const f of clean.slice(0, 50)) lines.push(`  · ${f}`);
+    return lines.join("\n");
+  }
+
+  // --- Git / CodeStats（直接 spawnSync — 不依赖 ToolRegistry 的 bash 异步路径）
+  private handleGit(p: string): string {
+    const t = p.trim();
+    try {
+      if (/git\s+status/i.test(t)) return this.runSync("git", ["status"]);
+      if (/git\s+diff/i.test(t)) return this.runSync("git", ["diff"]);
+      if (/git\s+pull/i.test(t)) return this.runSync("git", ["pull"]);
+      if (/git\s+log/i.test(t)) return this.runSync("git", ["log", "--oneline", "-n", "10"]);
+      const cloneM = t.match(/git\s+clone\s+['"]?(\S+?)['"]?(\s+(\S+))?$/i);
+      if (cloneM) {
+        const args = ["clone", cloneM[1]];
+        if (cloneM[3]) args.push(cloneM[3]);
+        return this.runSync("git", args);
       }
-      return candidates[0];
+      return `支持的 git 命令: status / diff / log / pull / clone <url> [dest]`;
+    } catch (e: unknown) {
+      return `✗ ${e instanceof Error ? e.message : String(e)}`;
     }
+  }
 
-    // Fallback: whole trimmed prompt
-    if (cleaned.length < 300 && cleaned.length > 2) {
-      const single = cleaned.split(/\s+/)[0];
-      if (existsSync(single)) return single;
+  private handleCodeStats(p: string): string {
+    const tokens = p.trim().split(/\s+/);
+    const dir = tokens[tokens.length - 1]?.replace(/[。！？!?]$/, "") || "src";
+    return this.runSync("bash", [
+      "-c",
+      `find "${dir}" -type f \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.md" \\) | xargs wc -l | tail -20`,
+    ]);
+  }
+
+  private runSync(bin: string, args: string[]): string {
+    const cmd = [bin, ...args].join(" ");
+    const dangerous = /(rm\s+-rf\s+\/\s*$|\bsudo\b|\bmkfs\b|\bdd\b.*of=\/dev)/;
+    if (dangerous.test(cmd)) return `✗ 拦截危险命令：${cmd}`;
+    try {
+      const r = spawnSync("sh", ["-c", cmd], { encoding: "utf-8", timeout: 15000, maxBuffer: 5 * 1024 * 1024 });
+      const out = (r.stdout || "").slice(0, 4000);
+      const err = (r.stderr || "").slice(0, 1500);
+      return `\`${cmd}\`\n\`\`\`\n${out}${err ? "\n[stderr]\n" + err : ""}\n\`\`\``;
+    } catch (e: unknown) {
+      return `✗ ${e instanceof Error ? e.message : String(e)}`;
     }
-    return null;
+  }
+
+  private tryMemoryAnswer(p: string): string | null {
+    const r = this.memory.query({ text: p, topK: 3, minSimilarity: 0.25 });
+    if (r.length === 0) return null;
+    const lines = [`（基于记忆给出的回答，不一定完整）`, ""];
+    for (const item of r) lines.push(`· ${item.entry.content.slice(0, 140)}`);
+    return lines.join("\n");
   }
 }
