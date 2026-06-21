@@ -190,11 +190,11 @@ export class LocalReasoner {
 
     // --- Self-assessment / Status (EN + CN) ---
     if (/self.?assessment|review your|your state|your current|status report|evolutionary state|your capabilities|your memory/i.test(lower)) {
-      return this.buildSelfAssessment(ctx);
+      return this.buildSelfAssessment({ ...ctx, relevantMemories: ctx.relevantMemories });
     }
     // Chinese status triggers (narrow: only explicit status requests)
     if (/^(更新|状态|报告|总结|检查|汇报|情况|进展)/.test(prompt)) {
-      return this.buildSelfAssessment(ctx);
+      return this.buildSelfAssessment({ ...ctx, relevantMemories: ctx.relevantMemories });
     }
 
     // --- File read (EN + CN) ---
@@ -381,11 +381,17 @@ export class LocalReasoner {
     memStats: { total: number; episodic: number; semantic: number; procedural: number };
     capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
     goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
+    relevantMemories?: Array<{ entry: { content: string; layer: string }; similarity: number }>;
   }) {
     const capNames = this.dedupCapabilities(ctx.capabilities).slice(0, 5).join(", ");
     const goalTargets = this.dedupGoals(ctx.goals).slice(0, 3).join(", ");
+    // Show actual memory content, not just stats
+    const recentMems = (ctx.relevantMemories || [])
+      .slice(0, 3)
+      .map(m => `[${m.entry.layer}] ${m.entry.content.slice(0, 80)} (sim:${m.similarity.toFixed(2)})`)
+      .join("\n");
     return {
-      intent: `Memory: ${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P) | Capabilities: ${capNames || "none"} | Goals: ${goalTargets || "none"}`,
+      intent: `Memory: ${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P)\nRecent:\n${recentMems || "No recent memories"}\nCapabilities: ${capNames || "none"}\nGoals: ${goalTargets || "none"}`,
       confidence: 0.95,
       toolAction: null,
       skillAction: null,

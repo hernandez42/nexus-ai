@@ -861,11 +861,22 @@ When you have enough information to answer, respond with:
       };
       this.learner.record(experience);
 
+      // If Round 1 produced a FINAL answer → check quality with LLM feedback
       if (finalStep) {
-        console.log("[Round 1] Final answer reached. Proceeding to explore/evolve anyway.");
+        console.log("[Round 1] Final answer reached. Checking quality...");
+        const qualityCheck = await this.config.llmCall([
+          { role: "system", content: "You are a quality checker. Rate the answer 0-1 and say if it addresses the user's question." },
+          { role: "user", content: `Question: ${prompt}\nAnswer: ${finalStep.content}\n\nRate 0-1. Does it answer the question? Respond with JSON: {"score": 0.8, "addresses": true}` },
+        ]);
+        const quality = this.parseQualityCheck(qualityCheck);
+        if (quality.score >= 0.7 && quality.addresses) {
+          console.log(`[Round 1] Quality ${quality.score} — answer is good, stopping.`);
+          break;
+        }
+        console.log(`[Round 1] Quality ${quality.score} — needs improvement, continuing.`);
       }
 
-      // Round 2: 探索（无论是否出 FINAL 都跑）
+      // Round 2: 探索（only if answer needs improvement or no FINAL yet）
       console.log("[Round 2] Exploring...");
       const goals = await this.explorer.explore(steps);
       allGoals.push(...goals);
@@ -876,19 +887,23 @@ When you have enough information to answer, respond with:
         console.log("[Round 2] No exploration goals.");
       }
 
-      // Round 3: 进化（无论是否有 goals 都跑）
-      console.log("[Round 3] Evolving...");
-      const recentExperiences = this.learner.getRecent(5);
-      const newCapabilities = await this.gep.runCycle(recentExperiences);
-      allCapabilities.push(...newCapabilities);
+      // Round 3: 进化（only if there are goals to evolve for）
+      let newCapabilities: Capability[] = [];
+      if (goals.length > 0) {
+        console.log("[Round 3] Evolving...");
+        const recentExperiences = this.learner.getRecent(5);
+        newCapabilities = await this.gep.runCycle(recentExperiences);
+        allCapabilities.push(...newCapabilities);
 
-      if (newCapabilities.length > 0) {
-        console.log(`[Round 3] Evolved ${newCapabilities.length} new capabilities: ${newCapabilities.map(c => c.name).join(", ")}`);
-        // 有新能力 → 更新 prompt，下一轮带新知识
-        currentPrompt = prompt + "\n\n[New capabilities available]: " +
-          newCapabilities.map(c => `${c.name}: ${c.description}`).join("; ");
+        if (newCapabilities.length > 0) {
+          console.log(`[Round 3] Evolved ${newCapabilities.length} new capabilities: ${newCapabilities.map(c => c.name).join(", ")}`);
+          currentPrompt = prompt + "\n\n[New capabilities available]: " +
+            newCapabilities.map(c => `${c.name}: ${c.description}`).join("; ");
+        } else {
+          console.log("[Round 3] No new capabilities evolved.");
+        }
       } else {
-        console.log("[Round 3] No new capabilities evolved.");
+        console.log("[Round 3] Skipped — no goals to evolve for.");
       }
 
       // 终止条件：没有新目标 AND 没有新能力 → 不再迭代
@@ -908,6 +923,22 @@ When you have enough information to answer, respond with:
       iterations: iteration,
       selfModel: this.currentSelfModel || undefined,
     };
+  }
+
+  private parseQualityCheck(text: string): { score: number; addresses: boolean } {
+    try {
+      const parsed = JSON.parse(text);
+      return { score: Number(parsed.score) || 0.5, addresses: Boolean(parsed.addresses) };
+    } catch {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return { score: Number(parsed.score) || 0.5, addresses: Boolean(parsed.addresses) };
+        } catch { /* fall through */ }
+      }
+      return { score: 0.5, addresses: false };
+    }
   }
 
   private extractLessons(steps: ReasonStep[]): string[] {
