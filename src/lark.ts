@@ -64,10 +64,13 @@ export async function startLarkBot(
       }
     }
 
-    console.log(`[Lark] Message from ${msg.senderId}: ${msg.content.slice(0, 100)}`);
+    console.log(`[Lark] Message from ${msg.senderId}: ${String(msg.content).slice(0, 100)}`);
+
+    // Ensure content is string (SDK may return object for rich text messages)
+    const textContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
 
     try {
-      const reply = await onMessage(msg.content, {
+      const reply = await onMessage(textContent, {
         chatId: msg.chatId,
         senderId: msg.senderId,
         messageId: msg.messageId,
