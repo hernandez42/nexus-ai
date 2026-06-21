@@ -233,7 +233,7 @@ export function convertResultsToEvolverSignals(
   if (consecutiveDiscards >= 5) {
     allSignals.push("plateau_pivot_required");
     corpusLines.push("");
-    corpusLines.push("[plateau_detection] ${consecutiveDiscards} consecutive discards — plateau_pivot_required");
+    corpusLines.push(`[plateau_detection] ${consecutiveDiscards} consecutive discards — plateau_pivot_required`);
   }
 
   // Write to Evolver's memory directory

@@ -150,7 +150,7 @@ describe("Gödel-Nexus: Self-Referential Properties", () => {
       name: "custom_analyze",
       description: "Analyze code quality",
       parameters: { code: "string" },
-      implementation: "return { quality: 'good' };",
+      handler: "self_inspect", // delegates to existing built-in action
     });
 
     const action = actions.get("propose_action")!;

@@ -28,6 +28,7 @@ import { createLLM } from "./llm";
 import { Logger } from "./logger";
 import { MemoryStore } from "./memory";
 import { TriOrchestrator } from "./triorchestrator";
+import { LocalReasoner } from "./local-reasoner";
 import { EternalAwakeningLoop } from "./self-awareness";
 import { ContinuousDeconstruction } from "./deconstruction";
 import { EvolutionEngine } from "./evolution";
@@ -444,22 +445,59 @@ async function runCycle(
 
   log.info(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
 
-  const orchestrator = new TriOrchestrator({
-    memoryDir: config.memoryDir,
-    systemPrompt,
-    maxReasoningSteps: config.modules.triOrchestrator.maxReasoningSteps,
-    tools,
-    genes,
-    llmCall: async (messages) => {
-      const response = await llm.chat(messages.map(m => ({ role: m.role as any, content: m.content })));
-      return response;
-    },
-  });
+  // ============================================================
+  // 6a. Local Reasoning — try local first, fall back to LLM
+  // ============================================================
+  const localReasoner = new LocalReasoner(memory);
+  for (const t of tools) {
+    localReasoner.registerTool({
+      name: t.name,
+      description: t.description,
+      execute: t.execute,
+    });
+  }
 
-  const result = await orchestrator.run(
-    prompt,
-    config.modules.triOrchestrator.maxIterations
-  );
+  log.info("Starting local reasoning...");
+  const localSteps = await localReasoner.reason(prompt, 5);
+  const localFinal = localSteps.find(s => s.type === "FINAL");
+
+  let result;
+  if (localFinal && localFinal.confidence >= 0.7) {
+    // Local reasoning succeeded — convert to TriOrchestrator format
+    log.info("Local reasoning succeeded", { confidence: localFinal.confidence, steps: localSteps.length });
+    result = {
+      steps: localSteps.map(s => ({
+        step: s.step,
+        type: s.type === "FINAL" ? "FINAL" as const : "THOUGHT" as const,
+        content: s.content,
+        timestamp: s.timestamp,
+      })),
+      goals: [],
+      newCapabilities: [],
+      finalAnswer: localFinal.content,
+      iterations: 1,
+      selfModel: undefined,
+    };
+  } else {
+    // Local failed — fall back to TriOrchestrator (LLM-based)
+    log.info("Local reasoning incomplete, falling back to TriOrchestrator");
+    const orchestrator = new TriOrchestrator({
+      memoryDir: config.memoryDir,
+      systemPrompt,
+      maxReasoningSteps: config.modules.triOrchestrator.maxReasoningSteps,
+      tools,
+      genes,
+      llmCall: async (messages) => {
+        const response = await llm.chat(messages.map(m => ({ role: m.role as any, content: m.content })));
+        return response;
+      },
+    });
+
+    result = await orchestrator.run(
+      prompt,
+      config.modules.triOrchestrator.maxIterations
+    );
+  }
 
   // Evolution pressure
   if (result.goals.length > 0) {
