@@ -109,16 +109,24 @@ async function main() {
     // Support both LARK_* and FEISHU_* env prefixes for backward compatibility
     const larkAppId = process.env.LARK_APP_ID || process.env.FEISHU_APP_ID || "";
     const larkAppSecret = process.env.LARK_APP_SECRET || process.env.FEISHU_APP_SECRET || "";
+    const allowFromRaw = process.env.LARK_ALLOW_FROM || process.env.FEISHU_ALLOW_FROM || "";
+    const allowFrom = allowFromRaw ? allowFromRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     if (!larkAppId || !larkAppSecret) {
       console.error("[Lark] LARK_APP_ID (or FEISHU_APP_ID) and LARK_APP_SECRET (or FEISHU_APP_SECRET) required. Set them in environment or nexus.env.");
       process.exit(1);
     }
 
+    if (allowFrom.length > 0) {
+      console.log(`[Lark] ALLOW_FROM whitelist: ${allowFrom.length} sender(s)`);
+    } else {
+      console.warn("[Lark] WARNING: No ALLOW_FROM set — all senders can trigger cycles. Set LARK_ALLOW_FROM or FEISHU_ALLOW_FROM (comma-separated open_id list).");
+    }
+
     console.log("[Lark] Starting bot...");
 
     await startLarkBot(
-      { appId: larkAppId, appSecret: larkAppSecret },
+      { appId: larkAppId, appSecret: larkAppSecret, allowFrom },
       async (text, sender) => {
         console.log(`[Lark] Processing message: ${text.slice(0, 100)}`);
         try {

@@ -16,6 +16,7 @@ import { createLarkChannel, type LarkChannel, type NormalizedMessage } from "@la
 export interface LarkConfig {
   appId: string;
   appSecret: string;
+  allowFrom?: string[]; // open_id whitelist (empty = allow all)
 }
 
 export interface LarkMessageHandler {
@@ -53,6 +54,14 @@ export async function startLarkBot(
     if (processedMessageIds.size > MESSAGE_DEDUP_WINDOW) {
       const first = processedMessageIds.values().next().value;
       if (first) processedMessageIds.delete(first);
+    }
+
+    // ALLOW_FROM whitelist check
+    if (config.allowFrom && config.allowFrom.length > 0) {
+      if (!config.allowFrom.includes(msg.senderId)) {
+        console.log(`[Lark] Rejected message from unauthorized sender: ${msg.senderId.slice(0, 16)}`);
+        return;
+      }
     }
 
     console.log(`[Lark] Message from ${msg.senderId}: ${msg.content.slice(0, 100)}`);
