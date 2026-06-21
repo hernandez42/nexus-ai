@@ -11,6 +11,7 @@
  */
 
 import { MemoryStore } from "./memory";
+import { SkillRegistry, SkillContext, SkillResult } from "./skills";
 
 export interface LocalReasonStep {
   step: number;
@@ -30,9 +31,13 @@ export interface ToolDef {
 export class LocalReasoner {
   private memory: MemoryStore;
   private tools: Map<string, ToolDef> = new Map();
+  private skills: SkillRegistry | null = null;
+  private skillContext: SkillContext | null = null;
 
-  constructor(memory: MemoryStore) {
+  constructor(memory: MemoryStore, skills?: SkillRegistry, skillContext?: SkillContext) {
     this.memory = memory;
+    this.skills = skills || null;
+    this.skillContext = skillContext || null;
   }
 
   registerTool(tool: ToolDef): void {
@@ -89,16 +94,29 @@ export class LocalReasoner {
     });
 
     // ============================================================
-    // Step 4: COMPOSE — 综合回复（如果有需要执行的工具，先执行）
+    // Step 4: COMPOSE — 综合回复（先尝试 skill，再尝试 tool）
     // ============================================================
     let toolResult: string | null = null;
-    if (reasoning.toolAction) {
+
+    // Try skill first (new skill system)
+    if (this.skills && this.skillContext && reasoning.skillAction) {
+      const skillResult = await this.skills.execute(
+        reasoning.skillAction.name,
+        reasoning.skillAction.params,
+        this.skillContext
+      );
+      toolResult = skillResult.success
+        ? skillResult.output
+        : `Skill error: ${skillResult.error}`;
+    }
+
+    // Fall back to old tool system
+    if (!toolResult && reasoning.toolAction) {
       const tool = this.tools.get(reasoning.toolAction.name);
       if (tool) {
         try {
           const raw = await tool.execute(reasoning.toolAction.params);
           toolResult = typeof raw === "string" ? raw : JSON.stringify(raw);
-          // Extract useful content from tool result
           if (typeof raw === "object" && raw !== null) {
             const obj = raw as Record<string, unknown>;
             toolResult = String(obj.output || obj.content || obj.result || toolResult);
@@ -148,7 +166,7 @@ export class LocalReasoner {
       goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
       recentRuns: Array<{ entry: { content: string } }>;
     }
-  ): { intent: string; confidence: number; toolAction: { name: string; params: Record<string, unknown> } | null } {
+  ): { intent: string; confidence: number; toolAction: { name: string; params: Record<string, unknown> } | null; skillAction: { name: string; params: Record<string, unknown> } | null } {
     const lower = prompt.toLowerCase();
 
     // --- Greeting / Identity ---
@@ -157,6 +175,7 @@ export class LocalReasoner {
         intent: "Greeting detected — respond as Nexus agent",
         confidence: 1.0,
         toolAction: null,
+        skillAction: null,
       };
     }
 
@@ -175,17 +194,20 @@ export class LocalReasoner {
         intent: `Self-assessment: Memory=${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P) | Capabilities: ${capNames || "none"} | Goals: ${goalTargets || "none"}`,
         confidence: 0.95,
         toolAction: null,
+        skillAction: null,
       };
     }
 
     // --- File read ---
     const fileMatch = lower.match(/read\s+(?:file\s+)?[`"']?(.+?)[`"']?\s*$/i) ||
                        lower.match(/(.+\.\w+)\s*content/i);
+    // --- File read ---
     if (fileMatch) {
       return {
         intent: `File read request: ${fileMatch[1]}`,
         confidence: 0.9,
-        toolAction: { name: "read", params: { path: fileMatch[1].trim() } },
+        toolAction: null,
+        skillAction: { name: "file_read", params: { path: fileMatch[1].trim() } },
       };
     }
 
@@ -196,7 +218,8 @@ export class LocalReasoner {
       return {
         intent: `Search request: pattern="${searchMatch[1]}"`,
         confidence: 0.85,
-        toolAction: { name: "search", params: { pattern: searchMatch[1].trim(), directory: "." } },
+        toolAction: null,
+        skillAction: { name: "bash", params: { command: `grep -r "${searchMatch[1].trim()}" . --include="*.ts" --include="*.js" -l` } },
       };
     }
 
@@ -207,7 +230,20 @@ export class LocalReasoner {
       return {
         intent: `Bash execution: ${bashMatch[1]}`,
         confidence: 0.7,
-        toolAction: { name: "bash", params: { command: bashMatch[1].trim() } },
+        toolAction: null,
+        skillAction: { name: "bash", params: { command: bashMatch[1].trim() } },
+      };
+    }
+
+    // --- Git clone ---
+    const gitMatch = lower.match(/clone\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i) ||
+                     lower.match(/download\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i);
+    if (gitMatch) {
+      return {
+        intent: `Git clone request: ${gitMatch[1]}`,
+        confidence: 0.9,
+        toolAction: null,
+        skillAction: { name: "git_clone", params: { url: gitMatch[1].trim() } },
       };
     }
 
@@ -220,6 +256,7 @@ export class LocalReasoner {
         intent: `Memory recall: ${ctx.relevantMemories.length} relevant entries found`,
         confidence: 0.85,
         toolAction: null,
+        skillAction: null,
       };
     }
 
@@ -234,6 +271,7 @@ export class LocalReasoner {
         intent: `Capability report: ${toolNames.length} tools (${toolNames.join(", ")}) + ${capNames.length} evolved capabilities`,
         confidence: 0.9,
         toolAction: null,
+        skillAction: null,
       };
     }
 
@@ -247,6 +285,7 @@ export class LocalReasoner {
         intent: `Goals: ${ctx.goals.length} knowledge gaps\n${goalList || "No goals identified yet"}`,
         confidence: 0.9,
         toolAction: null,
+        skillAction: null,
       };
     }
 
@@ -257,6 +296,7 @@ export class LocalReasoner {
         intent: `Memory-relevant response: similarity=${best.similarity.toFixed(2)}, source=[${best.entry.layer}]`,
         confidence: 0.6,
         toolAction: null,
+        skillAction: null,
       };
     }
 
@@ -264,6 +304,7 @@ export class LocalReasoner {
       intent: "No local rule matched — complex query, LLM fallback needed",
       confidence: 0.3,
       toolAction: null,
+        skillAction: null,
     };
   }
 

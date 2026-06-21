@@ -29,6 +29,7 @@ import { Logger } from "./logger";
 import { MemoryStore } from "./memory";
 import { TriOrchestrator } from "./triorchestrator";
 import { LocalReasoner } from "./local-reasoner";
+import { createDefaultSkills, SkillRegistry, SkillContext } from "./skills";
 import { EternalAwakeningLoop } from "./self-awareness";
 import { ContinuousDeconstruction } from "./deconstruction";
 import { EvolutionEngine } from "./evolution";
@@ -446,9 +447,20 @@ async function runCycle(
   log.info(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
 
   // ============================================================
-  // 6a. Local Reasoning — try local first, fall back to LLM
+  // 6a. Skill System — real execution capabilities
   // ============================================================
-  const localReasoner = new LocalReasoner(memory);
+  const skillRegistry = createDefaultSkills();
+  const skillContext: SkillContext = {
+    cwd: process.cwd(),
+    env: process.env as Record<string, string>,
+    log: (msg: string) => log.info(msg),
+  };
+  log.info("Skills registered", { skills: skillRegistry.list() });
+
+  // ============================================================
+  // 6b. Local Reasoning — try local first, fall back to LLM
+  // ============================================================
+  const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
   for (const t of tools) {
     localReasoner.registerTool({
       name: t.name,
