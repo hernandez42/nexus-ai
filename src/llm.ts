@@ -74,6 +74,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ============================================================
+// Prompt Truncation — prevent token limit overflow
+// ============================================================
+
+function truncateMessages(
+  messages: Array<{ role: string; content: string | unknown }>,
+  maxChars: number
+): ChatMessage[] {
+  let total = 0;
+  const result: ChatMessage[] = [];
+
+  // Process in reverse — keep system prompt, truncate older messages first
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    const remaining = maxChars - total;
+
+    if (remaining <= 0) break;
+
+    if (content.length <= remaining) {
+      result.unshift({ role: msg.role as ChatMessage["role"], content });
+      total += content.length;
+    } else {
+      // Truncate this message to fit
+      const truncated = content.slice(0, remaining);
+      result.unshift({ role: msg.role as ChatMessage["role"], content: truncated });
+      total += remaining;
+    }
+  }
+
+  // Always keep system prompt (first message) even if truncated
+  if (result.length === 0 && messages.length > 0) {
+    const first = messages[0];
+    const content = typeof first.content === "string" ? first.content : JSON.stringify(first.content);
+    result.push({ role: first.role as ChatMessage["role"], content: content.slice(0, maxChars) });
+  }
+
+  return result;
+}
+
 function withRetry(
   client: LLMClient,
   retryConfig: Partial<RetryConfig> = {}
@@ -82,11 +122,15 @@ function withRetry(
 
   return {
     async chat(messages) {
+      // Truncate messages to stay within token budget (~4 chars per token)
+      const MAX_TOTAL_CHARS = 80000; // ~20k tokens
+      const truncated = truncateMessages(messages, MAX_TOTAL_CHARS);
+
       let lastError: Error | undefined;
 
       for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
         try {
-          return await client.chat(messages);
+          return await client.chat(truncated);
         } catch (e: unknown) {
           lastError = e instanceof Error ? e : new Error(String(e));
 

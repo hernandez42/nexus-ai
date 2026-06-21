@@ -191,8 +191,8 @@ async function main() {
         const msg = e instanceof Error ? e.message : String(e);
         log.error("Memory save failed", { cycle: cycleCount, error: msg });
       }
-      log.info("Daemon: sleeping 60s", { cycle: cycleCount, memoryEntries: memory.stats().total });
-      await sleep(60000);
+      log.info("Daemon: sleeping 75s", { cycle: cycleCount, memoryEntries: memory.stats().total });
+      await sleep(75000); // 75s = 48 cycles/h < 50/h rate limit
     }
   } else {
     await runCycle(config, log, memory, { skipGlue, skipDeconstruct, skipSelfAwareness, prompt });
