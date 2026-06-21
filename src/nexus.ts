@@ -14,6 +14,7 @@
  * 使用方式：
  *   npm run start                    # 完整流程（单次）
  *   npm run start -- --daemon        # 守护模式（循环运行）
+ *   npm run start -- --lark          # 飞书机器人模式（WebSocket）
  *   npm run start -- "你的问题"       # 自定义问题
  *   npm run start -- --skip-glue     # 跳过格式转换
  *   npm run start -- --skip-deconstruct  # 跳过解构
@@ -33,6 +34,7 @@ import { EvolutionEngine } from "./evolution";
 import { convertAllSkills, generateSkillIndex } from "./glue/superpowers-to-eve";
 import { loadGenes, generatePiExtension } from "./glue/evolver-to-pimono";
 import { convertResultsToEvolverSignals, generateAutoResearchGene } from "./glue/autoresearch-to-evolver";
+import { startLarkBot, stopLarkBot } from "./lark";
 
 // ============================================================
 // Crash Protection — P2 #14
@@ -57,6 +59,7 @@ async function main() {
   const configPath = args.find((_, i) => args[i - 1] === "--config") || "./config.json";
   const initConfig = args.includes("--init");
   const daemonMode = args.includes("--daemon");
+  const larkMode = args.includes("--lark");
   const skipGlue = args.includes("--skip-glue");
   const skipDeconstruct = args.includes("--skip-deconstruct");
   const skipSelfAwareness = args.includes("--skip-self-awareness");
@@ -86,7 +89,7 @@ async function main() {
   mkdirSync(config.logDir, { recursive: true });
 
   const log = new Logger("Nexus", config.logDir, config.logLevel);
-  log.info("Nexus starting", { llm: config.llm.provider, model: config.llm.model, daemon: daemonMode });
+  log.info("Nexus starting", { llm: config.llm.provider, model: config.llm.model, daemon: daemonMode, lark: larkMode });
 
   // ============================================================
   // 0. Global Memory
@@ -98,6 +101,48 @@ async function main() {
   const saveInterval = setInterval(() => {
     if (memory.stats().total > 0) memory.save();
   }, 30000);
+
+  // ============================================================
+  // Lark Mode — 飞书机器人
+  // ============================================================
+  if (larkMode) {
+    const larkAppId = process.env.LARK_APP_ID || "";
+    const larkAppSecret = process.env.LARK_APP_SECRET || "";
+
+    if (!larkAppId || !larkAppSecret) {
+      console.error("[Lark] LARK_APP_ID and LARK_APP_SECRET required. Set them in environment or nexus.env.");
+      process.exit(1);
+    }
+
+    console.log("[Lark] Starting bot...");
+
+    await startLarkBot(
+      { appId: larkAppId, appSecret: larkAppSecret },
+      async (text, sender) => {
+        console.log(`[Lark] Processing message: ${text.slice(0, 100)}`);
+        try {
+          const result = await runCycle(config, log, memory, {
+            skipGlue, skipDeconstruct, skipSelfAwareness, prompt: text,
+          });
+          return result;
+        } catch (e: unknown) {
+          const err = e instanceof Error ? e.message : String(e);
+          console.error("[Lark] Cycle failed:", err);
+          return `[Error] ${err.slice(0, 500)}`;
+        }
+      }
+    );
+
+    // Keep process alive
+    process.on("SIGINT", async () => {
+      await stopLarkBot();
+      clearInterval(saveInterval);
+      memory.save();
+      process.exit(0);
+    });
+
+    return; // Lark handles its own loop
+  }
 
   // ============================================================
   // P0 #4: Daemon Mode — Loop instead of exit
@@ -131,7 +176,12 @@ async function main() {
           metadata: { cycle: cycleCount, error: err.message, stack: stack.slice(0, 500), durationMs: Date.now() - cycleStart },
         });
       }
-      memory.save(); // Force save after every cycle
+      try {
+        memory.save(); // Force save after every cycle
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log.error("Memory save failed", { cycle: cycleCount, error: msg });
+      }
       log.info("Daemon: sleeping 60s", { cycle: cycleCount, memoryEntries: memory.stats().total });
       await sleep(60000);
     }
@@ -159,7 +209,7 @@ async function runCycle(
   log: Logger,
   memory: MemoryStore,
   options: CycleOptions
-) {
+): Promise<string> {
   const { skipGlue, skipDeconstruct, skipSelfAwareness, prompt } = options;
 
   const pastMemories = memory.query({ text: prompt, topK: 5, minSimilarity: 0.01 });
@@ -520,6 +570,32 @@ async function runCycle(
   console.log(`\nMemory: ${memStats.total} total (${memStats.episodic} episodic, ${memStats.semantic} semantic, ${memStats.procedural} procedural)`);
   console.log(`Tools: ${tools.length} (${tools.length - 3} evolved)`);
   console.log(`Logs: ${config.logDir}`);
+
+  // Return formatted result for Lark / external callers
+  const outputLines = [
+    `**Final Answer**: ${result.finalAnswer.slice(0, 500)}`,
+    ``,
+    `Iterations: ${result.iterations} | Steps: ${result.steps.length}`,
+    `Goals: ${result.goals.length} | Capabilities: ${result.newCapabilities.length}`,
+    `Breakthroughs: ${breakthroughs.length} | Species: ${species.map(s => s.archetype).join(", ") || "none"}`,
+    `Memory: ${memStats.total} total (${memStats.episodic} episodic, ${memStats.semantic} semantic, ${memStats.procedural} procedural)`,
+  ];
+
+  if (result.newCapabilities.length > 0) {
+    outputLines.push("", "**New Capabilities**:");
+    for (const cap of result.newCapabilities) {
+      outputLines.push(`- ${cap.name}: ${cap.description.slice(0, 100)}`);
+    }
+  }
+
+  if (result.goals.length > 0) {
+    outputLines.push("", "**Goals**:");
+    for (const goal of result.goals) {
+      outputLines.push(`- ${goal.target} (priority ${goal.priority}): ${goal.reason.slice(0, 100)}`);
+    }
+  }
+
+  return outputLines.join("\n");
 }
 
 async function runGlue(config: any, log: Logger) {
