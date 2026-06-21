@@ -192,8 +192,8 @@ export class LocalReasoner {
     if (/self.?assessment|review your|your state|your current|status report|evolutionary state|your capabilities|your memory/i.test(lower)) {
       return this.buildSelfAssessment(ctx);
     }
-    // Chinese status triggers
-    if (/更新|状态|报告|总结|评估|分析|检查|汇报|情况|怎么样|进展/.test(prompt)) {
+    // Chinese status triggers (narrow: only explicit status requests)
+    if (/^(更新|状态|报告|总结|检查|汇报|情况|进展)/.test(prompt)) {
       return this.buildSelfAssessment(ctx);
     }
 
@@ -443,7 +443,7 @@ export class LocalReasoner {
     if (/self.?assessment|status report|evolutionary state|your state/i.test(prompt.toLowerCase())) {
       return this.analyzeSelf();
     }
-    if (/更新|状态|报告|总结|评估|分析|检查|汇报|情况|怎么样|进展/.test(prompt)) {
+    if (/^(更新|状态|报告|总结|检查|汇报|情况|进展)/.test(prompt)) {
       return this.analyzeSelf();
     }
 
