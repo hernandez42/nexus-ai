@@ -59,7 +59,10 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
 
   for (let step = 0; step < maxSteps; step++) {
     // Call LLM with tools
-    const result: ToolCallResult = await (llm.chatWithTools as Function)(messages, toolDefinitions);
+    if (!llm.chatWithTools) {
+      throw new Error("LLM provider does not support chatWithTools. Use OpenAI-compatible provider.");
+    }
+    const result: ToolCallResult = await llm.chatWithTools(messages, toolDefinitions);
 
     if (result.toolCalls && result.toolCalls.length > 0) {
       // LLM wants to call tools — execute them
