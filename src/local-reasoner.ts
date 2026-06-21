@@ -268,78 +268,212 @@ export class LocalReasoner {
   }
 
   /**
-   * 综合最终回复
-   * 基于 reasoning + memory + tool result 组合
+   * 综合最终回复 — 真正的本地推理分析
+   * 基于 reasoning + memory + tool result 组合，生成有洞察的回复
    */
   private composeReply(
     prompt: string,
     reasoning: { intent: string; confidence: number },
     toolResult: string | null,
   ): string {
-    const parts: string[] = [];
-
-    // If tool was executed, include its result
+    // If tool was executed, include its result first
     if (toolResult && !toolResult.startsWith("Error") && !toolResult.startsWith("Tool not found")) {
-      parts.push(toolResult.slice(0, 500));
+      return toolResult.slice(0, 800);
     }
 
-    // Add reasoning intent as context
-    if (reasoning.confidence >= 0.8) {
-      parts.push(reasoning.intent);
-    }
-
-    // For self-assessment, compose a structured report
-    if (/self.?assessment|status report|evolutionary state/i.test(prompt.toLowerCase())) {
-      return reasoning.intent; // Already contains full status
-    }
-
-    // For greetings, return identity
+    // --- Greeting: short identity, no fluff ---
     if (/^(hi|hello|hey|greetings|yo)\b/i.test(prompt) || /who are you|what is your name/i.test(prompt)) {
-      return "I am Nexus, an autonomous reasoning agent. I operate through local rule-based reasoning and memory. I can read files, search code, execute commands, and recall past experiences. How can I assist you?";
+      return "Nexus. Local reasoning + memory. What do you need?";
     }
 
-    // For memory queries, include relevant memories
+    // --- Self-assessment: analyze memory, not just list ---
+    if (/self.?assessment|status report|evolutionary state|your state/i.test(prompt.toLowerCase())) {
+      return this.analyzeSelf();
+    }
+
+    // --- Memory query: find patterns, not just dump ---
     if (/remember|memory|past/i.test(prompt.toLowerCase())) {
-      const memories = this.memory.query({ text: prompt, topK: 3, minSimilarity: 0.2 });
-      if (memories.length > 0) {
-        const memParts = memories.map(m =>
-          `[${m.entry.layer}] ${m.entry.content.slice(0, 150)}`
-        );
-        parts.push("Relevant memories:\n" + memParts.join("\n"));
-      }
+      return this.analyzeMemoryPatterns(prompt);
     }
 
-    // For capability queries
+    // --- Capability query: report what works, not just names ---
     if (/capabilities|skills|what can you do/i.test(prompt.toLowerCase())) {
-      const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 8, minSimilarity: 0.01 });
-      const toolNames = Array.from(this.tools.keys());
-      parts.push(`Available tools: ${toolNames.join(", ")}`);
-      if (caps.length > 0) {
-        const capNames = caps.map(c => {
-          const meta = c.entry.metadata;
-          return `- ${meta?.name || c.entry.content.slice(0, 30)}`;
-        });
-        parts.push(`Evolved capabilities:\n${capNames.join("\n")}`);
-      }
+      return this.analyzeCapabilities();
     }
 
-    // For goal queries
+    // --- Goal query: report gaps with analysis ---
     if (/goals|knowledge gap|what should/i.test(prompt.toLowerCase())) {
-      const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 5, minSimilarity: 0.01 });
-      if (goals.length > 0) {
-        const goalList = goals.map(g => {
-          const meta = g.entry.metadata;
-          return `- ${meta?.target || g.entry.content.slice(0, 50)} (priority ${meta?.priority || "?"})`;
-        });
-        parts.push(`Knowledge gaps:\n${goalList.join("\n")}`);
-      }
+      return this.analyzeGoals();
     }
 
-    // Fallback: combine what we have
-    if (parts.length === 0) {
-      parts.push(reasoning.intent);
+    // Fallback: reasoning intent (concise)
+    return reasoning.intent;
+  }
+
+  /**
+   * 真正的自我分析 — 从 memory 数据中提取洞察
+   */
+  private analyzeSelf(): string {
+    const stats = this.memory.stats();
+    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 10, minSimilarity: 0.01 });
+    const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 5, minSimilarity: 0.01 });
+    const recent = this.memory.query({ text: "run result", layer: "episodic", topK: 5, minSimilarity: 0.01 });
+
+    // Analyze: memory growth rate
+    const growth = stats.total > 0 ? "growing" : "empty";
+
+    // Analyze: capability diversity (count unique names)
+    const capNames = new Set(caps.map(c => {
+      const meta = c.entry.metadata;
+      return String(meta?.name || "").toLowerCase().replace(/[_\s-]/g, "");
+    }).filter(Boolean));
+    const diversity = capNames.size;
+
+    // Analyze: goal completion rate
+    const goalCount = goals.length;
+
+    // Analyze: recent activity
+    const active = recent.length > 0;
+
+    // Compose insight, not data dump
+    const lines: string[] = [];
+    lines.push(`Memory: ${stats.total} entries (${stats.episodic}E/${stats.semantic}S/${stats.procedural}P) — ${growth}`);
+
+    if (diversity > 0) {
+      lines.push(`Capabilities: ${diversity} distinct (${caps.length} total)`);
+      // Report top 3 by frequency in memory
+      const topCaps = caps.slice(0, 3).map(c => {
+        const meta = c.entry.metadata;
+        return String(meta?.name || c.entry.content.slice(0, 25));
+      });
+      lines.push(`Top: ${topCaps.join(", ")}`);
+    } else {
+      lines.push("Capabilities: none evolved yet");
     }
 
-    return parts.join("\n\n");
+    if (goalCount > 0) {
+      lines.push(`Goals: ${goalCount} gaps identified`);
+      const topGoal = goals[0];
+      const gMeta = topGoal.entry.metadata;
+      lines.push(`Priority: ${gMeta?.target || topGoal.entry.content.slice(0, 40)}`);
+    } else {
+      lines.push("Goals: none — exploration may be stalled");
+    }
+
+    if (active) {
+      lines.push("Activity: recent runs detected");
+    } else {
+      lines.push("Activity: no recent runs");
+    }
+
+    // Add diagnosis
+    if (stats.total < 100) {
+      lines.push("Diagnosis: memory too sparse — need more cycles");
+    } else if (diversity === 0 && stats.total > 500) {
+      lines.push("Diagnosis: memory rich but no capabilities — explore/evolve may be broken");
+    } else if (goalCount === 0) {
+      lines.push("Diagnosis: no goals — signal extraction may need tuning");
+    } else {
+      lines.push("Diagnosis: operational");
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * 分析 memory 模式 — 找关联、趋势，而非罗列
+   */
+  private analyzeMemoryPatterns(prompt: string): string {
+    const memories = this.memory.query({ text: prompt, topK: 10, minSimilarity: 0.15 });
+    if (memories.length === 0) return "No relevant memories.";
+
+    // Group by layer
+    const byLayer: Record<string, typeof memories> = {};
+    for (const m of memories) {
+      const layer = m.entry.layer || "unknown";
+      (byLayer[layer] ||= []).push(m);
+    }
+
+    const lines: string[] = [];
+    lines.push(`Found ${memories.length} relevant memories:`);
+
+    for (const [layer, items] of Object.entries(byLayer)) {
+      const top = items[0];
+      lines.push(`[${layer}] ${items.length} entries — best match: ${top.entry.content.slice(0, 60)} (sim=${top.similarity.toFixed(2)})`);
+    }
+
+    // Detect pattern: repeated content
+    const contents = memories.map(m => m.entry.content.slice(0, 30));
+    const unique = new Set(contents);
+    if (unique.size < contents.length * 0.7) {
+      lines.push("Pattern: high repetition detected — possible redundant storage");
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * 分析 capabilities — 报告实际效用，而非名字列表
+   */
+  private analyzeCapabilities(): string {
+    const caps = this.memory.query({ text: "capability", layer: "procedural", topK: 15, minSimilarity: 0.01 });
+    const toolNames = Array.from(this.tools.keys());
+
+    if (caps.length === 0) {
+      return `Tools: ${toolNames.join(", ")}\nEvolved: none yet`;
+    }
+
+    // Deduplicate
+    const seen = new Set<string>();
+    const unique = caps.filter(c => {
+      const name = String(c.entry.metadata?.name || c.entry.content).toLowerCase().replace(/[_\s-]/g, "");
+      if (seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+
+    const lines: string[] = [];
+    lines.push(`Tools: ${toolNames.join(", ")}`);
+    lines.push(`Evolved: ${unique.length} distinct capabilities (${caps.length} total in memory)`);
+
+    // Report top 5 with content preview
+    for (const c of unique.slice(0, 5)) {
+      const name = c.entry.metadata?.name || c.entry.content.slice(0, 30);
+      lines.push(`- ${name}`);
+    }
+
+    if (caps.length > unique.length * 1.5) {
+      lines.push(`Note: ${caps.length - unique.length} duplicates detected — dedup recommended`);
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * 分析 goals — 报告优先级和可行性
+   */
+  private analyzeGoals(): string {
+    const goals = this.memory.query({ text: "knowledge gap", layer: "semantic", topK: 8, minSimilarity: 0.01 });
+
+    if (goals.length === 0) return "No goals identified. Exploration may not be producing signals.";
+
+    const lines: string[] = [];
+    lines.push(`${goals.length} knowledge gaps:`);
+
+    // Sort by priority if available
+    const sorted = [...goals].sort((a, b) => {
+      const pa = Number(a.entry.metadata?.priority) || 5;
+      const pb = Number(b.entry.metadata?.priority) || 5;
+      return pb - pa; // higher priority first
+    });
+
+    for (const g of sorted.slice(0, 5)) {
+      const meta = g.entry.metadata;
+      const target = meta?.target || g.entry.content.slice(0, 40);
+      const priority = meta?.priority || "?";
+      lines.push(`- [P${priority}] ${target}`);
+    }
+
+    return lines.join("\n");
   }
 }
