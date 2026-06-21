@@ -458,41 +458,9 @@ async function runCycle(
   log.info("Skills registered", { skills: skillRegistry.list() });
 
   // ============================================================
-  // 6b. Local Reasoning — try local first, fall back to LLM
+  // 6a2. TriOrchestrator factory (LLM-based reasoning)
   // ============================================================
-  const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
-  for (const t of tools) {
-    localReasoner.registerTool({
-      name: t.name,
-      description: t.description,
-      execute: t.execute,
-    });
-  }
-
-  log.info("Starting local reasoning...");
-  const localSteps = await localReasoner.reason(prompt, 5);
-  const localFinal = localSteps.find(s => s.type === "FINAL");
-
-  let result;
-  if (localFinal && localFinal.confidence >= 0.5) {
-    // Local reasoning succeeded — convert to TriOrchestrator format
-    log.info("Local reasoning succeeded", { confidence: localFinal.confidence, steps: localSteps.length });
-    result = {
-      steps: localSteps.map(s => ({
-        step: s.step,
-        type: s.type === "FINAL" ? "FINAL" as const : "THOUGHT" as const,
-        content: s.content,
-        timestamp: s.timestamp,
-      })),
-      goals: [],
-      newCapabilities: [],
-      finalAnswer: localFinal.content,
-      iterations: 1,
-      selfModel: undefined,
-    };
-  } else {
-    // Local failed — fall back to TriOrchestrator (LLM-based)
-    log.info("Local reasoning incomplete, falling back to TriOrchestrator");
+  const runTriOrchestrator = async () => {
     const orchestrator = new TriOrchestrator({
       memoryDir: config.memoryDir,
       systemPrompt,
@@ -504,11 +472,58 @@ async function runCycle(
         return response;
       },
     });
+    return orchestrator.run(prompt, config.modules.triOrchestrator.maxIterations);
+  };
 
-    result = await orchestrator.run(
-      prompt,
-      config.modules.triOrchestrator.maxIterations
-    );
+  // ============================================================
+  // 6b. Local Reasoning — ONLY for simple queries (greeting/status)
+  // Everything else goes directly to LLM for real thinking
+  // ============================================================
+  const localReasoner = new LocalReasoner(memory, skillRegistry, skillContext);
+  for (const t of tools) {
+    localReasoner.registerTool({
+      name: t.name,
+      description: t.description,
+      execute: t.execute,
+    });
+  }
+
+  // Check if this is a simple query that can be handled locally
+  const isSimpleQuery = /^(hi|hello|hey|greetings|yo)\b/i.test(prompt) ||
+    /^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt) ||
+    /^(状态|更新|报告|总结|检查|汇报|情况|进展)/.test(prompt) ||
+    /self.?assessment|status report|evolutionary state|your state/i.test(prompt);
+
+  let result;
+  if (isSimpleQuery) {
+    // Simple query — use LocalReasoner (no LLM, fast)
+    log.info("Simple query detected, using local reasoning");
+    const localSteps = await localReasoner.reason(prompt, 5);
+    const localFinal = localSteps.find(s => s.type === "FINAL");
+
+    if (localFinal && localFinal.content) {
+      result = {
+        steps: localSteps.map(s => ({
+          step: s.step,
+          type: s.type === "FINAL" ? "FINAL" as const : "THOUGHT" as const,
+          content: s.content,
+          timestamp: s.timestamp,
+        })),
+        goals: [],
+        newCapabilities: [],
+        finalAnswer: localFinal.content,
+        iterations: 1,
+        selfModel: undefined,
+      };
+    } else {
+      // Local failed even for simple query — fall back to LLM
+      log.info("Local reasoning failed for simple query, falling back to LLM");
+      result = await runTriOrchestrator();
+    }
+  } else {
+    // Complex query — go directly to LLM for real thinking
+    log.info("Complex query, going directly to TriOrchestrator (LLM)");
+    result = await runTriOrchestrator();
   }
 
   // Evolution pressure
