@@ -22,6 +22,33 @@ export interface ToolDef {
   execute: (params: Record<string, unknown>) => Promise<string>;
 }
 
+/**
+ * Convert nexus tool parameters (e.g. { path: "string", offset: "number?" })
+ * to OpenAI JSON Schema format.
+ */
+function convertParamsToOpenAI(params: Record<string, unknown>): { type: string; properties: Record<string, unknown>; required: string[] } {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+
+  for (const [key, val] of Object.entries(params)) {
+    const typeStr = String(val);
+    const isOptional = typeStr.endsWith("?");
+    const baseType = isOptional ? typeStr.slice(0, -1) : typeStr;
+
+    let schema: Record<string, unknown> = {};
+    if (baseType === "string") schema = { type: "string" };
+    else if (baseType === "number") schema = { type: "number" };
+    else if (baseType === "boolean") schema = { type: "boolean" };
+    else if (baseType === "object") schema = { type: "object" };
+    else schema = { type: "string" }; // fallback
+
+    properties[key] = schema;
+    if (!isOptional) required.push(key);
+  }
+
+  return { type: "object", properties, required };
+}
+
 export interface ToolLoopConfig {
   systemPrompt: string;
   userPrompt: string;
@@ -46,7 +73,7 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<ToolLoopResul
     function: {
       name: t.name,
       description: t.description,
-      parameters: t.parameters,
+      parameters: convertParamsToOpenAI(t.parameters),
     },
   }));
 
