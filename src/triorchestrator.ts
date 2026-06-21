@@ -188,7 +188,7 @@ If you have enough information to answer the user's question, set done: true and
       ]);
 
       const thoughtParsed = this.safeParseJSON(thoughtRaw, { thought: thoughtRaw, done: false, final_answer: "" });
-      const thoughtContent = thoughtParsed.thought || thoughtRaw;
+      const thoughtContent = String(thoughtParsed.thought || thoughtRaw);
 
       this.steps.push({
         step: stepNum,
@@ -320,9 +320,11 @@ Respond with JSON:
   }
 
   private extractSignalsFromText(text: string): string[] {
+    // Defense: ensure text is string
+    const safeText = typeof text === "string" ? text : JSON.stringify(text);
     // 基于 Evolver 的 signal 提取逻辑（简化版）
     const signals: string[] = [];
-    const lower = text.toLowerCase();
+    const lower = safeText.toLowerCase();
 
     const patterns: Array<[string[], string]> = [
       // Error signals
