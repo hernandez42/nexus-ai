@@ -169,7 +169,7 @@ export class LocalReasoner {
   ): { intent: string; confidence: number; toolAction: { name: string; params: Record<string, unknown> } | null; skillAction: { name: string; params: Record<string, unknown> } | null } {
     const lower = prompt.toLowerCase();
 
-    // --- Greeting / Identity ---
+    // --- Greeting / Identity (EN + CN) ---
     if (/^(hi|hello|hey|greetings|yo)\b/i.test(lower) || /who are you|what is your name|introduce yourself/i.test(lower)) {
       return {
         intent: "Greeting detected — respond as Nexus agent",
@@ -178,30 +178,28 @@ export class LocalReasoner {
         skillAction: null,
       };
     }
-
-    // --- Self-assessment / Status ---
-    if (/self.?assessment|review your|your state|your current|status report|evolutionary state|your capabilities|your memory/i.test(lower)) {
-      const capNames = ctx.capabilities.slice(0, 5).map(c => {
-        const meta = c.entry.metadata;
-        return meta?.name || c.entry.content.slice(0, 40);
-      }).join(", ");
-      const goalTargets = ctx.goals.slice(0, 3).map(g => {
-        const meta = g.entry.metadata;
-        return meta?.target || g.entry.content.slice(0, 40);
-      }).join(", ");
-
+    // Chinese greetings
+    if (/^(你好|嗨|哈喽|早上好|下午好|晚上好)/.test(prompt)) {
       return {
-        intent: `Self-assessment: Memory=${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P) | Capabilities: ${capNames || "none"} | Goals: ${goalTargets || "none"}`,
-        confidence: 0.95,
+        intent: "Greeting detected — respond as Nexus agent",
+        confidence: 1.0,
         toolAction: null,
         skillAction: null,
       };
     }
 
-    // --- File read ---
+    // --- Self-assessment / Status (EN + CN) ---
+    if (/self.?assessment|review your|your state|your current|status report|evolutionary state|your capabilities|your memory/i.test(lower)) {
+      return this.buildSelfAssessment(ctx);
+    }
+    // Chinese status triggers
+    if (/更新|状态|报告|总结|评估|分析|检查|汇报|情况|怎么样|进展/.test(prompt)) {
+      return this.buildSelfAssessment(ctx);
+    }
+
+    // --- File read (EN + CN) ---
     const fileMatch = lower.match(/read\s+(?:file\s+)?[`"']?(.+?)[`"']?\s*$/i) ||
                        lower.match(/(.+\.\w+)\s*content/i);
-    // --- File read ---
     if (fileMatch) {
       return {
         intent: `File read request: ${fileMatch[1]}`,
@@ -210,8 +208,18 @@ export class LocalReasoner {
         skillAction: { name: "file_read", params: { path: fileMatch[1].trim() } },
       };
     }
+    // Chinese file read
+    const cnFileMatch = prompt.match(/(?:读|看|查看|读取|打开)\s*[`"']?(.+?\.\w+)[`"']?/);
+    if (cnFileMatch) {
+      return {
+        intent: `File read request: ${cnFileMatch[1]}`,
+        confidence: 0.9,
+        toolAction: null,
+        skillAction: { name: "file_read", params: { path: cnFileMatch[1].trim() } },
+      };
+    }
 
-    // --- Search ---
+    // --- Search (EN + CN) ---
     const searchMatch = lower.match(/search\s+(?:for\s+)?[`"']?(.+?)[`"']?/i) ||
                          lower.match(/find\s+(?:files?\s+with\s+)?[`"']?(.+?)[`"']?/i);
     if (searchMatch) {
@@ -222,8 +230,18 @@ export class LocalReasoner {
         skillAction: { name: "bash", params: { command: `grep -r "${searchMatch[1].trim()}" . --include="*.ts" --include="*.js" -l` } },
       };
     }
+    // Chinese search
+    const cnSearchMatch = prompt.match(/(?:搜索|查找|找|搜)\s*[`"']?(.+?)[`"']?$/);
+    if (cnSearchMatch) {
+      return {
+        intent: `Search request: pattern="${cnSearchMatch[1]}"`,
+        confidence: 0.85,
+        toolAction: null,
+        skillAction: { name: "bash", params: { command: `grep -r "${cnSearchMatch[1].trim()}" . --include="*.ts" --include="*.js" -l` } },
+      };
+    }
 
-    // --- Bash ---
+    // --- Bash (EN + CN) ---
     const bashMatch = lower.match(/run\s+[`"']?(.+?)[`"']?$/i) ||
                       lower.match(/execute\s+[`"']?(.+?)[`"']?$/i);
     if (bashMatch) {
@@ -234,8 +252,18 @@ export class LocalReasoner {
         skillAction: { name: "bash", params: { command: bashMatch[1].trim() } },
       };
     }
+    // Chinese bash
+    const cnBashMatch = prompt.match(/(?:执行|运行|跑)\s*[`"']?(.+?)[`"']?$/);
+    if (cnBashMatch) {
+      return {
+        intent: `Bash execution: ${cnBashMatch[1]}`,
+        confidence: 0.7,
+        toolAction: null,
+        skillAction: { name: "bash", params: { command: cnBashMatch[1].trim() } },
+      };
+    }
 
-    // --- Git clone ---
+    // --- Git clone (EN + CN) ---
     const gitMatch = lower.match(/clone\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i) ||
                      lower.match(/download\s+(?:repo\s+)?[`"']?(https?:\/\/.+?)[`"']?/i);
     if (gitMatch) {
@@ -246,12 +274,27 @@ export class LocalReasoner {
         skillAction: { name: "git_clone", params: { url: gitMatch[1].trim() } },
       };
     }
+    // Chinese git clone
+    const cnGitMatch = prompt.match(/(?:克隆|下载|拉取)\s*[`"']?(https?:\/\/.+?)[`"']?/);
+    if (cnGitMatch) {
+      return {
+        intent: `Git clone request: ${cnGitMatch[1]}`,
+        confidence: 0.9,
+        toolAction: null,
+        skillAction: { name: "git_clone", params: { url: cnGitMatch[1].trim() } },
+      };
+    }
 
-    // --- Memory query ---
+    // --- Memory query (EN + CN) ---
     if (/remember|memory|past experience|what do you know/i.test(lower)) {
-      const memSummary = ctx.relevantMemories.slice(0, 3).map(m =>
-        `[${m.entry.layer}] ${m.entry.content.slice(0, 80)}`
-      ).join("\n");
+      return {
+        intent: `Memory recall: ${ctx.relevantMemories.length} relevant entries found`,
+        confidence: 0.85,
+        toolAction: null,
+        skillAction: null,
+      };
+    }
+    if (/记忆|记得|回忆|之前/.test(prompt)) {
       return {
         intent: `Memory recall: ${ctx.relevantMemories.length} relevant entries found`,
         confidence: 0.85,
@@ -260,51 +303,84 @@ export class LocalReasoner {
       };
     }
 
-    // --- Capability query ---
+    // --- Capability query (EN + CN) ---
     if (/what can you do|capabilities|skills|tools available/i.test(lower)) {
-      const toolNames = Array.from(this.tools.keys());
-      const capNames = ctx.capabilities.slice(0, 8).map(c => {
-        const meta = c.entry.metadata;
-        return meta?.name || c.entry.content.slice(0, 30);
-      });
-      return {
-        intent: `Capability report: ${toolNames.length} tools (${toolNames.join(", ")}) + ${capNames.length} evolved capabilities`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: null,
-      };
+      return this.buildCapabilityReport(ctx);
+    }
+    if (/你会什么|能力|功能|技能|工具/.test(prompt)) {
+      return this.buildCapabilityReport(ctx);
     }
 
-    // --- Goal query ---
+    // --- Goal query (EN + CN) ---
     if (/goals|knowledge gap|what should.*learn|what.*explore/i.test(lower)) {
-      const goalList = ctx.goals.slice(0, 5).map(g => {
-        const meta = g.entry.metadata;
-        return `- ${meta?.target || g.entry.content.slice(0, 50)} (priority ${meta?.priority || "?"})`;
-      }).join("\n");
-      return {
-        intent: `Goals: ${ctx.goals.length} knowledge gaps\n${goalList || "No goals identified yet"}`,
-        confidence: 0.9,
-        toolAction: null,
-        skillAction: null,
-      };
+      return this.buildGoalReport(ctx);
+    }
+    if (/目标|缺口|学习|探索|计划/.test(prompt)) {
+      return this.buildGoalReport(ctx);
     }
 
-    // --- Fallback: use memory + general response ---
-    if (ctx.relevantMemories.length > 0) {
-      const best = ctx.relevantMemories[0];
-      return {
-        intent: `Memory-relevant response: similarity=${best.similarity.toFixed(2)}, source=[${best.entry.layer}]`,
-        confidence: 0.6,
-        toolAction: null,
-        skillAction: null,
-      };
-    }
+    // --- Fallback: generate meaningful status instead of raw similarity ---
+    return this.buildSelfAssessment(ctx);
+  }
 
+  /**
+   * Helper: build self-assessment intent
+   */
+  private buildSelfAssessment(ctx: {
+    memStats: { total: number; episodic: number; semantic: number; procedural: number };
+    capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
+    goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
+  }) {
+    const capNames = ctx.capabilities.slice(0, 5).map(c => {
+      const meta = c.entry.metadata;
+      return meta?.name || c.entry.content.slice(0, 40);
+    }).join(", ");
+    const goalTargets = ctx.goals.slice(0, 3).map(g => {
+      const meta = g.entry.metadata;
+      return meta?.target || g.entry.content.slice(0, 40);
+    }).join(", ");
     return {
-      intent: "No local rule matched — complex query, LLM fallback needed",
-      confidence: 0.3,
+      intent: `Memory: ${ctx.memStats.total} (${ctx.memStats.episodic}E/${ctx.memStats.semantic}S/${ctx.memStats.procedural}P) | Capabilities: ${capNames || "none"} | Goals: ${goalTargets || "none"}`,
+      confidence: 0.95,
       toolAction: null,
-        skillAction: null,
+      skillAction: null,
+    };
+  }
+
+  /**
+   * Helper: build capability report intent
+   */
+  private buildCapabilityReport(ctx: {
+    capabilities: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
+  }) {
+    const toolNames = Array.from(this.tools.keys());
+    const capNames = ctx.capabilities.slice(0, 8).map(c => {
+      const meta = c.entry.metadata;
+      return meta?.name || c.entry.content.slice(0, 30);
+    });
+    return {
+      intent: `Tools: ${toolNames.join(", ")} | Evolved: ${capNames.join(", ") || "none"}`,
+      confidence: 0.9,
+      toolAction: null,
+      skillAction: null,
+    };
+  }
+
+  /**
+   * Helper: build goal report intent
+   */
+  private buildGoalReport(ctx: {
+    goals: Array<{ entry: { content: string; metadata?: Record<string, unknown> } }>;
+  }) {
+    const goalList = ctx.goals.slice(0, 5).map(g => {
+      const meta = g.entry.metadata;
+      return `- ${meta?.target || g.entry.content.slice(0, 50)} (P${meta?.priority || "?"})`;
+    }).join("\n");
+    return {
+      intent: `Goals: ${ctx.goals.length} gaps\n${goalList || "No goals yet"}`,
+      confidence: 0.9,
+      toolAction: null,
+      skillAction: null,
     };
   }
 
