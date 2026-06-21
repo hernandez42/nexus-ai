@@ -57,8 +57,10 @@ export async function startLarkBot(
     }
 
     // ALLOW_FROM whitelist check
-    if (config.allowFrom && config.allowFrom.length > 0) {
-      if (!config.allowFrom.includes(msg.senderId)) {
+    // Defense: "*" or empty strings in allowFrom = allow all (misconfig protection)
+    const effectiveWhitelist = (config.allowFrom || []).filter(s => s && s !== "*");
+    if (effectiveWhitelist.length > 0) {
+      if (!effectiveWhitelist.includes(msg.senderId)) {
         console.log(`[Lark] Rejected message from unauthorized sender: ${msg.senderId.slice(0, 16)}`);
         return;
       }
